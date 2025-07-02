@@ -19,11 +19,15 @@ class LLMChatGUI:
         self.sessions = {}  # {session_id: {"name": str, "history": list, "created": datetime, "notes": str}}
         self.current_session_id = None
         self.sessions_file = "chat_sessions.pkl"
-        self.user_notes_file = "user_notes.json"
+        
+        # User profile management
+        self.current_user_profile = "default"
+        self.user_profiles = {}  # {profile_name: user_notes_dict}
+        self.user_profiles_file = "user_profiles.json"
         
         # Load eksisterende data
         self.load_sessions()
-        self.load_user_notes()
+        self.load_user_profiles()
         
         # System prompts
         self.danish_prompt = "Du er en hjælpsom assistent der svarer på dansk. Hold svarene korte og præcise."
@@ -88,8 +92,22 @@ class LLMChatGUI:
         notes_frame = ttk.LabelFrame(top_panel, text="🧠 AI Noter om dig", padding="5")
         notes_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
         
+        # User profile controls
+        profile_controls = ttk.Frame(notes_frame)
+        profile_controls.pack(fill=tk.X, pady=(0, 5))
+        
+        ttk.Label(profile_controls, text="👤 Profil:").pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.profile_var = tk.StringVar(value=self.current_user_profile)
+        self.profile_combo = ttk.Combobox(profile_controls, textvariable=self.profile_var, width=12, state="readonly")
+        self.profile_combo.pack(side=tk.LEFT, padx=(0, 5))
+        self.profile_combo.bind('<<ComboboxSelected>>', self.switch_user_profile)
+        
+        ttk.Button(profile_controls, text="➕", command=self.create_new_profile, width=3).pack(side=tk.LEFT, padx=(2, 5))
+        ttk.Button(profile_controls, text="🗑️", command=self.delete_profile, width=3).pack(side=tk.LEFT, padx=(0, 5))
+        
         notes_controls = ttk.Frame(notes_frame)
-        notes_controls.pack(fill=tk.X, pady=(0, 5))
+        notes_controls.pack(fill=tk.X, pady=(5, 5))
         
         ttk.Button(notes_controls, text="🔄 Opdater noter", command=self.update_user_notes, width=15).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(notes_controls, text="👁️ Vis alle", command=self.show_full_notes, width=10).pack(side=tk.LEFT)
@@ -191,10 +209,11 @@ class LLMChatGUI:
         # Opdater displays (kun hvis GUI er klar)
         if hasattr(self, 'sessions_listbox'):
             self.refresh_sessions_list()
+            self.refresh_profile_combo()
             self.refresh_notes_display()
             
             # Tilføj velkomstbesked
-            self.add_to_chat("System", "Velkommen! AI'en husker dig mellem samtaler og tager noter om dine præferencer.\nCtrl+Enter for at sende besked.", "system")
+            self.add_to_chat("System", f"Velkommen! AI'en husker dig mellem samtaler. Aktuel profil: {self.current_user_profile}\nCtrl+Enter for at sende besked.", "system")
     
     # Session Management
     def create_new_session(self):
@@ -303,15 +322,19 @@ class LLMChatGUI:
         self.chat_display.delete("1.0", tk.END)
         self.chat_display.config(state=tk.DISABLED)
     
-    # AI Noter System
-    def load_user_notes(self):
-        """Load bruger noter"""
+    # User Profile Management
+    def load_user_profiles(self):
+        """Load alle bruger profiler"""
         try:
-            if os.path.exists(self.user_notes_file):
-                with open(self.user_notes_file, 'r', encoding='utf-8') as f:
-                    self.user_notes = json.load(f)
+            if os.path.exists(self.user_profiles_file):
+                with open(self.user_profiles_file, 'r', encoding='utf-8') as f:
+                    self.user_profiles = json.load(f)
             else:
-                self.user_notes = {
+                self.user_profiles = {}
+            
+            # Sikr at default profil eksisterer
+            if "default" not in self.user_profiles:
+                self.user_profiles["default"] = {
                     "personality": "",
                     "preferences": "",
                     "interests": "",
@@ -319,23 +342,113 @@ class LLMChatGUI:
                     "technical_level": "",
                     "last_updated": ""
                 }
-        except:
-            self.user_notes = {
-                "personality": "",
-                "preferences": "",
-                "interests": "",
-                "communication_style": "",
-                "technical_level": "",
-                "last_updated": ""
-            }
-    
-    def save_user_notes(self):
-        """Gem bruger noter"""
-        try:
-            with open(self.user_notes_file, 'w', encoding='utf-8') as f:
-                json.dump(self.user_notes, f, ensure_ascii=False, indent=2)
+            
+            # Set current user notes til aktuel profil
+            self.user_notes = self.user_profiles[self.current_user_profile]
+            
         except Exception as e:
-            print(f"Fejl ved gemning af noter: {e}")
+            print(f"Fejl ved loading af profiler: {e}")
+            self.user_profiles = {
+                "default": {
+                    "personality": "",
+                    "preferences": "",
+                    "interests": "",
+                    "communication_style": "",
+                    "technical_level": "",
+                    "last_updated": ""
+                }
+            }
+            self.user_notes = self.user_profiles["default"]
+    
+    def save_user_profiles(self):
+        """Gem alle bruger profiler"""
+        try:
+            # Opdater aktuel profil før gemning
+            self.user_profiles[self.current_user_profile] = self.user_notes.copy()
+            
+            with open(self.user_profiles_file, 'w', encoding='utf-8') as f:
+                json.dump(self.user_profiles, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Fejl ved gemning af profiler: {e}")
+    
+    def create_new_profile(self):
+        """Opret ny bruger profil"""
+        profile_name = simpledialog.askstring("Ny profil", "Navn på ny profil:")
+        if not profile_name or profile_name in self.user_profiles:
+            if profile_name in self.user_profiles:
+                messagebox.showwarning("Advarsel", f"Profil '{profile_name}' eksisterer allerede!")
+            return
+        
+        # Opret ny tom profil
+        self.user_profiles[profile_name] = {
+            "personality": "",
+            "preferences": "",
+            "interests": "",
+            "communication_style": "",
+            "technical_level": "",
+            "last_updated": ""
+        }
+        
+        # Skift til ny profil
+        self.current_user_profile = profile_name
+        self.user_notes = self.user_profiles[profile_name]
+        
+        # Opdater GUI
+        self.refresh_profile_combo()
+        self.profile_var.set(profile_name)
+        self.refresh_notes_display()
+        self.save_user_profiles()
+        
+        self.add_to_chat("System", f"Ny profil '{profile_name}' oprettet og aktiveret! 👤", "system")
+    
+    def delete_profile(self):
+        """Slet bruger profil"""
+        if self.current_user_profile == "default":
+            messagebox.showwarning("Advarsel", "Kan ikke slette 'default' profilen!")
+            return
+        
+        if messagebox.askyesno("Bekræft", f"Slet profil '{self.current_user_profile}' og alle noter?"):
+            del self.user_profiles[self.current_user_profile]
+            
+            # Skift til default
+            self.current_user_profile = "default"
+            self.user_notes = self.user_profiles["default"]
+            
+            # Opdater GUI
+            self.refresh_profile_combo()
+            self.profile_var.set("default")
+            self.refresh_notes_display()
+            self.save_user_profiles()
+            
+            self.add_to_chat("System", "Profil slettet. Skiftet til 'default' profil.", "system")
+    
+    def switch_user_profile(self, event=None):
+        """Skift bruger profil"""
+        new_profile = self.profile_var.get()
+        if new_profile == self.current_user_profile:
+            return
+        
+        # Gem aktuel profil
+        self.user_profiles[self.current_user_profile] = self.user_notes.copy()
+        
+        # Skift til ny profil
+        self.current_user_profile = new_profile
+        self.user_notes = self.user_profiles[new_profile]
+        
+        # Opdater displays
+        self.refresh_notes_display()
+        self.save_user_profiles()
+        
+        self.add_to_chat("System", f"Skiftet til profil: {new_profile} 👤", "system")
+    
+    def refresh_profile_combo(self):
+        """Opdater profil dropdown"""
+        if hasattr(self, 'profile_combo'):
+            profiles = list(self.user_profiles.keys())
+            self.profile_combo['values'] = profiles
+            if self.current_user_profile not in profiles:
+                self.current_user_profile = "default"
+            self.profile_var.set(self.current_user_profile)
     
     def update_user_notes(self):
         """Bed AI om at opdatere bruger noter"""
@@ -368,7 +481,7 @@ Tidligere noter:
 Seneste samtale:
 {conversation_text}
 
-VIGTIGT: Svar KUN med valid JSON - ingen forklaring eller ekstra tekst!
+VIGTIGT: Svar KUN med valid JSON - ingen forklaring eller ekstra tekst!"""
         
         # Send til AI i baggrunden
         threading.Thread(target=self._get_ai_notes_update, args=(analysis_prompt,), daemon=True).start()
@@ -409,7 +522,7 @@ VIGTIGT: Svar KUN med valid JSON - ingen forklaring eller ekstra tekst!
                     if all(field in updated_notes for field in required_fields):
                         # Opdater noter
                         self.user_notes.update(updated_notes)
-                        self.save_user_notes()
+                        self.save_user_profiles()  # Gem til profil system
                         
                         # Opdater GUI
                         self.root.after(0, self._handle_notes_update_success)
@@ -465,14 +578,14 @@ VIGTIGT: Svar KUN med valid JSON - ingen forklaring eller ekstra tekst!
             
             self.notes_display.insert("1.0", notes_text)
         else:
-            self.notes_display.insert("1.0", "Ingen noter endnu. Chat med AI'en og klik 'Opdater noter' for at få personlige noter!")
+            self.notes_display.insert("1.0", f"Ingen noter for '{self.current_user_profile}' endnu. Chat med AI'en og klik 'Opdater noter' for at få personlige noter!")
         
         self.notes_display.config(state=tk.DISABLED)
     
     def show_full_notes(self):
         """Vis alle noter i nyt vindue"""
         notes_window = tk.Toplevel(self.root)
-        notes_window.title("🧠 Komplette AI Noter")
+        notes_window.title(f"🧠 Komplette AI Noter - {self.current_user_profile}")
         notes_window.geometry("600x400")
         
         notes_text = scrolledtext.ScrolledText(notes_window, wrap=tk.WORD, font=("Arial", 11))
@@ -780,7 +893,7 @@ VIGTIGT: Svar KUN med valid JSON - ingen forklaring eller ekstra tekst!
         
         # Gem alle data
         self.save_sessions()
-        self.save_user_notes()
+        self.save_user_profiles()
         
         self.root.destroy()
 

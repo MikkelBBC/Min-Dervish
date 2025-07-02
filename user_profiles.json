@@ -1,0 +1,26 @@
+{
+  "default": {
+    "personality": "",
+    "preferences": "",
+    "interests": "",
+    "communication_style": "",
+    "technical_level": "",
+    "last_updated": ""
+  },
+  "Mikkel": {
+    "personality": "friendly",
+    "preferences": "helpful",
+    "interests": "technology, music, sports",
+    "communication_style": "polite and direct",
+    "technical_level": "mellemliggende",
+    "last_updated": "2025-07-02 15:03"
+  },
+  "Poul": {
+    "personality": "",
+    "preferences": "",
+    "interests": "",
+    "communication_style": "",
+    "technical_level": "",
+    "last_updated": ""
+  }
+}
