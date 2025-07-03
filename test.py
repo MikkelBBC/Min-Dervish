@@ -9,29 +9,40 @@ import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox, simpledialog
 import os
 import pickle
+import hashlib
+import getpass
 
 class LLMChatGUI:
     def __init__(self, llm_url="http://localhost:1234/v1/chat/completions"):
-        # Hvis LM Studio kører på anden port, ændr 1234 til den korrekte port
+        # LLM URL
         self.llm_url = llm_url
         
-        # Session management
-        self.sessions = {}  # {session_id: {"name": str, "history": list, "created": datetime, "notes": str}}
-        self.current_session_id = None
-        self.sessions_file = "chat_sessions.pkl"
+        # Bruger identifikation
+        self.current_user = self.get_or_create_user()
+        self.user_data_dir = f"user_data_{self.current_user}"
+        self.ensure_user_directory()
         
-        # User profile management
-        self.current_user_profile = "default"
-        self.user_profiles = {}  # {profile_name: user_notes_dict}
-        self.user_profiles_file = "user_profiles.json"
+        # Session management (per bruger)
+        self.sessions = {}
+        self.current_session_id = None
+        self.sessions_file = os.path.join(self.user_data_dir, "chat_sessions.pkl")
+        
+        # AI Noter system (løbende og automatisk)
+        self.ai_notes = {}  # Format: {kategori: {note_id: note_data}}
+        self.notes_file = os.path.join(self.user_data_dir, "ai_notes.json")
+        self.auto_note_threshold = 3  # Antal beskeder før automatisk note-opdatering
+        self.message_count = 0
         
         # Load eksisterende data
         self.load_sessions()
-        self.load_user_profiles()
+        self.load_ai_notes()
         
         # System prompts
-        self.danish_prompt = "Du er en hjælpsom assistent der svarer på dansk. Hold svarene korte og præcise."
-        self.english_prompt = "You are a helpful assistant that always responds in English, even if the user writes in Danish or other languages. Keep responses concise and clear."
+        self.danish_prompt = """Du er en hjælpsom assistent der svarer på dansk. Hold svarene korte og præcise. 
+        Du har adgang til noter om brugeren som kan hjælpe dig med at give bedre og mere personlige svar."""
+        
+        self.english_prompt = """You are a helpful assistant that always responds in English, even if the user writes in Danish or other languages. 
+        Keep responses concise and clear. You have access to user notes that can help you provide better, more personalized responses."""
         
         self.system_prompt = {
             "role": "system",
@@ -45,10 +56,10 @@ class LLMChatGUI:
         self.microphone = None
         self.is_listening = False
         
-        # GUI setup FØRST
+        # GUI setup
         self.setup_gui()
         
-        # Start med ny session EFTER GUI er oprettet
+        # Start med ny session
         self.create_new_session()
         
         self.init_tts()
@@ -57,23 +68,39 @@ class LLMChatGUI:
         # Test forbindelse ved start
         self.test_connection()
     
+    def get_or_create_user(self):
+        """Få eller opret bruger ID baseret på system"""
+        # Kombiner username og computer navn for unik ID
+        username = getpass.getuser()
+        computer_name = os.environ.get('COMPUTERNAME', os.environ.get('HOSTNAME', 'unknown'))
+        user_string = f"{username}@{computer_name}"
+        
+        # Lav hash for privatliv
+        user_hash = hashlib.md5(user_string.encode()).hexdigest()[:8]
+        return user_hash
+    
+    def ensure_user_directory(self):
+        """Sikr at bruger directory eksisterer"""
+        if not os.path.exists(self.user_data_dir):
+            os.makedirs(self.user_data_dir)
+    
     def setup_gui(self):
         """Opret GUI vindue"""
         self.root = tk.Tk()
-        self.root.title("🤖 LLM Chat med Sessions & AI Noter")
-        self.root.geometry("1000x700")
+        self.root.title(f"🤖 LLM Chat - Bruger: {self.current_user}")
+        self.root.geometry("1200x800")
         self.root.configure(bg="#f0f0f0")
         
         # Hovedframe
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Top panel med sessions og noter
+        # Top panel med sessions og AI noter
         top_panel = ttk.Frame(main_frame)
         top_panel.pack(fill=tk.X, pady=(0, 10))
         
         # Sessions panel (venstre)
-        sessions_frame = ttk.LabelFrame(top_panel, text="📁 Samtaler", padding="5")
+        sessions_frame = ttk.LabelFrame(top_panel, text="📁 Mine Samtaler", padding="5")
         sessions_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 5))
         
         sessions_controls = ttk.Frame(sessions_frame)
@@ -88,33 +115,39 @@ class LLMChatGUI:
         self.sessions_listbox.pack(fill=tk.BOTH, expand=True)
         self.sessions_listbox.bind('<Double-Button-1>', self.load_selected_session)
         
-        # AI Noter panel (højre)
-        notes_frame = ttk.LabelFrame(top_panel, text="🧠 AI Noter om dig", padding="5")
+        # AI Noter panel (højre) - Nu med kategorier
+        notes_frame = ttk.LabelFrame(top_panel, text="🧠 AI Noter (Automatiske)", padding="5")
         notes_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
         
-        # User profile controls
-        profile_controls = ttk.Frame(notes_frame)
-        profile_controls.pack(fill=tk.X, pady=(0, 5))
-        
-        ttk.Label(profile_controls, text="👤 Profil:").pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.profile_var = tk.StringVar(value=self.current_user_profile)
-        self.profile_combo = ttk.Combobox(profile_controls, textvariable=self.profile_var, width=12, state="readonly")
-        self.profile_combo.pack(side=tk.LEFT, padx=(0, 5))
-        self.profile_combo.bind('<<ComboboxSelected>>', self.switch_user_profile)
-        
-        ttk.Button(profile_controls, text="➕", command=self.create_new_profile, width=3).pack(side=tk.LEFT, padx=(2, 5))
-        ttk.Button(profile_controls, text="🗑️", command=self.delete_profile, width=3).pack(side=tk.LEFT, padx=(0, 5))
-        
+        # Noter controls
         notes_controls = ttk.Frame(notes_frame)
-        notes_controls.pack(fill=tk.X, pady=(5, 5))
+        notes_controls.pack(fill=tk.X, pady=(0, 5))
         
-        ttk.Button(notes_controls, text="🔄 Opdater noter", command=self.update_user_notes, width=15).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(notes_controls, text="👁️ Vis alle", command=self.show_full_notes, width=10).pack(side=tk.LEFT)
+        ttk.Button(notes_controls, text="🔄 Opdater nu", command=self.force_update_notes, width=12).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(notes_controls, text="👁️ Alle noter", command=self.show_all_notes, width=10).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(notes_controls, text="🧹 Ryd noter", command=self.clear_notes, width=10).pack(side=tk.LEFT)
         
-        self.notes_display = scrolledtext.ScrolledText(notes_frame, height=4, font=("Arial", 9), 
+        # Note kategorier dropdown
+        kategori_frame = ttk.Frame(notes_frame)
+        kategori_frame.pack(fill=tk.X, pady=(5, 5))
+        
+        ttk.Label(kategori_frame, text="📂 Kategori:").pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.kategori_var = tk.StringVar(value="Alle")
+        self.kategori_combo = ttk.Combobox(kategori_frame, textvariable=self.kategori_var, width=15, state="readonly")
+        self.kategori_combo['values'] = ['Alle', 'Personlighed', 'Interesser', 'Præferencer', 'Færdigheder', 'Mål', 'Andre']
+        self.kategori_combo.pack(side=tk.LEFT, padx=(0, 5))
+        self.kategori_combo.bind('<<ComboboxSelected>>', self.refresh_notes_display)
+        
+        # Note display
+        self.notes_display = scrolledtext.ScrolledText(notes_frame, height=6, font=("Arial", 9), 
                                                       bg="#f9f9f9", fg="darkblue")
         self.notes_display.pack(fill=tk.BOTH, expand=True)
+        
+        # Auto-note status
+        self.auto_note_label = ttk.Label(notes_frame, text="🤖 Auto-noter: Aktiveret", 
+                                        font=("Arial", 8, "italic"))
+        self.auto_note_label.pack(fill=tk.X, pady=(2, 0))
         
         # Chat display område
         chat_frame = ttk.LabelFrame(main_frame, text="💬 Samtale", padding="5")
@@ -190,6 +223,16 @@ class LLMChatGUI:
         )
         self.english_checkbox.pack(side=tk.LEFT, padx=(0, 20))
         
+        # Auto-noter toggle
+        self.auto_notes_var = tk.BooleanVar(value=True)
+        self.auto_notes_checkbox = ttk.Checkbutton(
+            controls_row, 
+            text="🤖 Auto-noter", 
+            variable=self.auto_notes_var,
+            command=self.toggle_auto_notes
+        )
+        self.auto_notes_checkbox.pack(side=tk.LEFT, padx=(0, 20))
+        
         # Clear chat
         ttk.Button(
             controls_row, 
@@ -197,28 +240,339 @@ class LLMChatGUI:
             command=self.clear_chat
         ).pack(side=tk.LEFT, padx=(0, 10))
         
-        # Session navn
-        self.session_name_label = ttk.Label(controls_row, text="📝 Aktuel: Ny samtale", 
+        # Session navn og bruger info
+        info_frame = ttk.Frame(controls_row)
+        info_frame.pack(side=tk.LEFT, padx=(20, 10))
+        
+        self.session_name_label = ttk.Label(info_frame, text="📝 Aktuel: Ny samtale", 
                                            font=("Arial", 10, "italic"))
-        self.session_name_label.pack(side=tk.LEFT, padx=(20, 10))
+        self.session_name_label.pack(anchor=tk.W)
         
-        # Status
-        self.status_label = ttk.Label(controls_row, text="🟡 Starter...")
-        self.status_label.pack(side=tk.RIGHT)
+        self.user_label = ttk.Label(info_frame, text=f"👤 Bruger: {self.current_user}", 
+                                   font=("Arial", 8, "italic"))
+        self.user_label.pack(anchor=tk.W)
         
-        # Opdater displays (kun hvis GUI er klar)
-        if hasattr(self, 'sessions_listbox'):
-            self.refresh_sessions_list()
-            self.refresh_profile_combo()
-            self.refresh_notes_display()
-            
-            # Tilføj velkomstbesked
-            self.add_to_chat("System", f"Velkommen! AI'en husker dig mellem samtaler. Aktuel profil: {self.current_user_profile}\nCtrl+Enter for at sende besked.", "system")
+        # Status og note counter
+        status_frame = ttk.Frame(controls_row)
+        status_frame.pack(side=tk.RIGHT)
+        
+        self.status_label = ttk.Label(status_frame, text="🟡 Starter...")
+        self.status_label.pack(anchor=tk.E)
+        
+        self.note_counter_label = ttk.Label(status_frame, text="📝 Noter: 0", 
+                                           font=("Arial", 8, "italic"))
+        self.note_counter_label.pack(anchor=tk.E)
+        
+        # Load data og opdater displays
+        self.refresh_sessions_list()
+        self.refresh_notes_display()
+        self.update_note_counter()
+        
+        # Tilføj velkomstbesked
+        self.add_to_chat("System", f"Velkommen! Du er logget ind som bruger {self.current_user}.\nAI'en tager automatiske noter om dig og husker mellem samtaler.\nCtrl+Enter for at sende besked.", "system")
     
-    # Session Management
+    # AI Noter System (Forbedret og automatisk)
+    def load_ai_notes(self):
+        """Load AI noter fra fil"""
+        try:
+            if os.path.exists(self.notes_file):
+                with open(self.notes_file, 'r', encoding='utf-8') as f:
+                    self.ai_notes = json.load(f)
+            else:
+                self.ai_notes = {
+                    "Personlighed": {},
+                    "Interesser": {},
+                    "Præferencer": {},
+                    "Færdigheder": {},
+                    "Mål": {},
+                    "Andre": {}
+                }
+        except Exception as e:
+            print(f"Fejl ved loading af AI noter: {e}")
+            self.ai_notes = {
+                "Personlighed": {},
+                "Interesser": {},
+                "Præferencer": {},
+                "Færdigheder": {},
+                "Mål": {},
+                "Andre": {}
+            }
+    
+    def save_ai_notes(self):
+        """Gem AI noter til fil"""
+        try:
+            with open(self.notes_file, 'w', encoding='utf-8') as f:
+                json.dump(self.ai_notes, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"Fejl ved gemning af AI noter: {e}")
+    
+    def check_auto_note_update(self):
+        """Tjek om det er tid til automatisk note opdatering"""
+        if not self.auto_notes_var.get():
+            return
+            
+        self.message_count += 1
+        
+        if self.message_count >= self.auto_note_threshold:
+            self.message_count = 0
+            threading.Thread(target=self._auto_update_notes, daemon=True).start()
+    
+    def _auto_update_notes(self):
+        """Automatisk opdatering af noter (baggrund)"""
+        try:
+            # Saml seneste beskeder til analyse
+            recent_messages = []
+            for msg in self.conversation_history[-6:]:  # Sidste 6 beskeder
+                if msg["role"] in ["user", "assistant"]:
+                    recent_messages.append(f"{msg['role']}: {msg['content']}")
+            
+            if len(recent_messages) < 2:
+                return
+            
+            conversation_text = "\n".join(recent_messages)
+            
+            analysis_prompt = f"""Analyser denne seneste samtale og udtræk nye indsigter om brugeren.
+
+EKSISTERENDE NOTER:
+{json.dumps(self.ai_notes, ensure_ascii=False, indent=1)}
+
+SENESTE SAMTALE:
+{conversation_text}
+
+Svar med PRÆCIS dette JSON format - ingen ekstra tekst:
+{{
+    "nye_noter": [
+        {{
+            "kategori": "Personlighed|Interesser|Præferencer|Færdigheder|Mål|Andre",
+            "note": "kort specifik note",
+            "relevans": 1-10
+        }}
+    ],
+    "opdaterede_noter": [
+        {{
+            "kategori": "kategori_navn",
+            "note_id": "eksisterende_note_id",
+            "ny_note": "opdateret note tekst"
+        }}
+    ]
+}}
+
+Kun tilføj noter hvis der er nye, relevante indsigter. Tom liste er OK."""
+            
+            headers = {"Content-Type": "application/json"}
+            data = {
+                "messages": [{"role": "user", "content": analysis_prompt}],
+                "temperature": 0.2,
+                "max_tokens": 500,
+                "stream": False
+            }
+            
+            response = requests.post(self.llm_url, json=data, headers=headers, timeout=30)
+            response.raise_for_status()
+            result = response.json()
+            
+            ai_response = result['choices'][0]['message']['content'].strip()
+            
+            # Parse JSON respons
+            try:
+                ai_response = ai_response.replace('```json', '').replace('```', '').strip()
+                start = ai_response.find('{')
+                end = ai_response.rfind('}') + 1
+                
+                if start >= 0 and end > start:
+                    json_str = ai_response[start:end]
+                    note_updates = json.loads(json_str)
+                    
+                    # Behandl nye noter
+                    new_count = 0
+                    if "nye_noter" in note_updates:
+                        for note_data in note_updates["nye_noter"]:
+                            if note_data.get("relevans", 0) >= 5:  # Kun relevante noter
+                                kategori = note_data.get("kategori", "Andre")
+                                note_text = note_data.get("note", "")
+                                
+                                if kategori in self.ai_notes and note_text:
+                                    note_id = str(int(time.time() * 1000))  # Timestamp som ID
+                                    self.ai_notes[kategori][note_id] = {
+                                        "note": note_text,
+                                        "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                        "relevans": note_data.get("relevans", 5)
+                                    }
+                                    new_count += 1
+                    
+                    # Behandl opdateringer
+                    update_count = 0
+                    if "opdaterede_noter" in note_updates:
+                        for update_data in note_updates["opdaterede_noter"]:
+                            kategori = update_data.get("kategori")
+                            note_id = update_data.get("note_id")
+                            ny_note = update_data.get("ny_note")
+                            
+                            if (kategori in self.ai_notes and 
+                                note_id in self.ai_notes[kategori] and 
+                                ny_note):
+                                self.ai_notes[kategori][note_id]["note"] = ny_note
+                                self.ai_notes[kategori][note_id]["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+                                update_count += 1
+                    
+                    # Gem og opdater GUI hvis der er ændringer
+                    if new_count > 0 or update_count > 0:
+                        self.save_ai_notes()
+                        self.root.after(0, self._handle_auto_notes_success, new_count, update_count)
+                    
+            except json.JSONDecodeError as e:
+                print(f"Auto-noter JSON fejl: {e}")
+                
+        except Exception as e:
+            print(f"Auto-noter fejl: {e}")
+    
+    def _handle_auto_notes_success(self, new_count, update_count):
+        """Håndter succesfuld auto-note opdatering"""
+        self.refresh_notes_display()
+        self.update_note_counter()
+        
+        if new_count > 0 or update_count > 0:
+            status_msg = f"🤖 {new_count} nye noter"
+            if update_count > 0:
+                status_msg += f", {update_count} opdateret"
+            self.auto_note_label.config(text=status_msg)
+            
+            # Reset til normal status efter 3 sekunder
+            self.root.after(3000, lambda: self.auto_note_label.config(text="🤖 Auto-noter: Aktiveret"))
+    
+    def force_update_notes(self):
+        """Tving note opdatering nu"""
+        if len(self.conversation_history) < 3:
+            messagebox.showinfo("Info", "For få beskeder til at opdatere noter. Chat lidt mere først!")
+            return
+        
+        self.auto_note_label.config(text="🔄 Opdaterer noter...")
+        threading.Thread(target=self._auto_update_notes, daemon=True).start()
+    
+    def refresh_notes_display(self, event=None):
+        """Opdater noter display baseret på valgt kategori"""
+        if not hasattr(self, 'notes_display'):
+            return
+        
+        self.notes_display.config(state=tk.NORMAL)
+        self.notes_display.delete("1.0", tk.END)
+        
+        kategori = self.kategori_var.get()
+        
+        if kategori == "Alle":
+            # Vis alle kategorier
+            for kat_navn, noter in self.ai_notes.items():
+                if noter:  # Kun hvis der er noter i kategorien
+                    self.notes_display.insert(tk.END, f"📂 {kat_navn}\n", f"kategori_{kat_navn}")
+                    for note_id, note_data in sorted(noter.items(), 
+                                                   key=lambda x: x[1].get("created", ""), reverse=True)[:3]:  # Max 3 per kategori
+                        relevans = "⭐" * note_data.get("relevans", 1)
+                        self.notes_display.insert(tk.END, f"  • {note_data['note']} {relevans}\n")
+                    self.notes_display.insert(tk.END, "\n")
+        else:
+            # Vis specifik kategori
+            if kategori in self.ai_notes and self.ai_notes[kategori]:
+                self.notes_display.insert(tk.END, f"📂 {kategori}\n\n", f"kategori_{kategori}")
+                for note_id, note_data in sorted(self.ai_notes[kategori].items(), 
+                                               key=lambda x: x[1].get("created", ""), reverse=True):
+                    created = note_data.get("created", "Ukendt")
+                    relevans = "⭐" * note_data.get("relevans", 1)
+                    self.notes_display.insert(tk.END, f"• {note_data['note']} {relevans}\n")
+                    self.notes_display.insert(tk.END, f"  📅 {created}\n\n")
+            else:
+                self.notes_display.insert(tk.END, f"Ingen noter i '{kategori}' endnu.\n\nChat med AI'en og den vil automatisk tilføje noter!")
+        
+        # Styling
+        for kat in self.ai_notes.keys():
+            self.notes_display.tag_config(f"kategori_{kat}", foreground="darkblue", font=("Arial", 10, "bold"))
+        
+        self.notes_display.config(state=tk.DISABLED)
+    
+    def show_all_notes(self):
+        """Vis alle noter i nyt vindue"""
+        notes_window = tk.Toplevel(self.root)
+        notes_window.title(f"🧠 Alle AI Noter - Bruger: {self.current_user}")
+        notes_window.geometry("800x600")
+        
+        # Notebook for kategorier
+        notebook = ttk.Notebook(notes_window)
+        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        for kategori, noter in self.ai_notes.items():
+            if noter:  # Kun kategorier med noter
+                frame = ttk.Frame(notebook)
+                notebook.add(frame, text=f"{kategori} ({len(noter)})")
+                
+                text_widget = scrolledtext.ScrolledText(frame, wrap=tk.WORD, font=("Arial", 11))
+                text_widget.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+                
+                for note_id, note_data in sorted(noter.items(), 
+                                               key=lambda x: x[1].get("created", ""), reverse=True):
+                    created = note_data.get("created", "Ukendt")
+                    relevans = "⭐" * note_data.get("relevans", 1)
+                    text_widget.insert(tk.END, f"• {note_data['note']} {relevans}\n")
+                    text_widget.insert(tk.END, f"  📅 Oprettet: {created}\n")
+                    if "updated" in note_data:
+                        text_widget.insert(tk.END, f"  🔄 Opdateret: {note_data['updated']}\n")
+                    text_widget.insert(tk.END, "\n")
+                
+                text_widget.config(state=tk.DISABLED)
+    
+    def clear_notes(self):
+        """Ryd alle AI noter efter bekræftelse"""
+        if messagebox.askyesno("Bekræft", "Slet ALLE AI noter? Dette kan ikke fortrydes!"):
+            self.ai_notes = {
+                "Personlighed": {},
+                "Interesser": {},
+                "Præferencer": {},
+                "Færdigheder": {},
+                "Mål": {},
+                "Andre": {}
+            }
+            self.save_ai_notes()
+            self.refresh_notes_display()
+            self.update_note_counter()
+            self.add_to_chat("System", "🧹 Alle AI noter er slettet!", "system")
+    
+    def update_note_counter(self):
+        """Opdater note tæller"""
+        if hasattr(self, 'note_counter_label'):
+            total_notes = sum(len(noter) for noter in self.ai_notes.values())
+            self.note_counter_label.config(text=f"📝 Noter: {total_notes}")
+    
+    def toggle_auto_notes(self):
+        """Toggle automatiske noter"""
+        enabled = self.auto_notes_var.get()
+        status = "Aktiveret" if enabled else "Deaktiveret"
+        self.auto_note_label.config(text=f"🤖 Auto-noter: {status}")
+        
+        if enabled:
+            self.add_to_chat("System", "🤖 Automatiske noter aktiveret!", "system")
+        else:
+            self.add_to_chat("System", "🤖 Automatiske noter deaktiveret.", "system")
+    
+    def get_notes_for_ai(self):
+        """Få noter til AI system prompt"""
+        if not any(self.ai_notes.values()):
+            return ""
+        
+        notes_summary = "\n\nVigtige noter om brugeren (brug til at give bedre svar):\n"
+        
+        for kategori, noter in self.ai_notes.items():
+            if noter:
+                # Få de mest relevante noter (højeste relevans score)
+                top_notes = sorted(noter.items(), 
+                                 key=lambda x: x[1].get("relevans", 0), reverse=True)[:2]
+                if top_notes:
+                    notes_summary += f"\n{kategori}:\n"
+                    for note_id, note_data in top_notes:
+                        notes_summary += f"  - {note_data['note']}\n"
+        
+        return notes_summary
+    
+    # Session Management (forbedret med bruger isolation)
     def create_new_session(self):
         """Opret ny session"""
-        # Hvis GUI ikke er klar endnu, brug default
         if not hasattr(self, 'sessions_listbox'):
             session_name = f"Samtale {len(self.sessions) + 1}"
         else:
@@ -227,26 +581,40 @@ class LLMChatGUI:
             if not session_name:
                 return
         
-        session_id = str(int(time.time()))
+        session_id = f"{self.current_user}_{int(time.time())}"  # Bruger-specifik ID
         self.sessions[session_id] = {
             "name": session_name,
             "history": [self.system_prompt.copy()],
             "created": datetime.now(),
-            "notes": ""
+            "user": self.current_user  # Sikr bruger tilhørighed
         }
         
         self.current_session_id = session_id
         self.conversation_history = self.sessions[session_id]["history"]
+        self.message_count = 0  # Reset message counter
         
-        # Kun opdater GUI hvis den eksisterer
         if hasattr(self, 'sessions_listbox'):
             self.refresh_sessions_list()
             self.clear_chat_display()
             self.update_session_label()
             self.add_to_chat("System", f"Ny samtale '{session_name}' oprettet!", "system")
     
+    def load_sessions(self):
+        """Load kun denne brugers sessions"""
+        try:
+            if os.path.exists(self.sessions_file):
+                with open(self.sessions_file, 'rb') as f:
+                    all_sessions = pickle.load(f)
+                    # Filtrer kun denne brugers sessions
+                    self.sessions = {k: v for k, v in all_sessions.items() 
+                                   if v.get("user") == self.current_user}
+            else:
+                self.sessions = {}
+        except:
+            self.sessions = {}
+    
     def load_selected_session(self, event=None):
-        """Load valgt session"""
+        """Load valgt session (kun hvis den tilhører brugeren)"""
         selection = self.sessions_listbox.curselection()
         if not selection:
             return
@@ -254,23 +622,30 @@ class LLMChatGUI:
         session_info = self.sessions_listbox.get(selection[0])
         session_id = session_info.split(" - ")[0]
         
-        if session_id in self.sessions:
+        # Sikr at sessionen tilhører denne bruger
+        if (session_id in self.sessions and 
+            self.sessions[session_id].get("user") == self.current_user):
             self.current_session_id = session_id
             self.conversation_history = self.sessions[session_id]["history"]
             self.refresh_chat_from_history()
             self.update_session_label()
+            self.message_count = 0  # Reset counter for loaded session
+        else:
+            messagebox.showerror("Adgang nægtet", "Du har ikke adgang til denne samtale!")
     
     def save_current_session(self):
         """Gem aktuel session"""
-        if self.current_session_id and self.current_session_id in self.sessions:
+        if (self.current_session_id and 
+            self.current_session_id in self.sessions and
+            self.sessions[self.current_session_id].get("user") == self.current_user):
             self.sessions[self.current_session_id]["history"] = self.conversation_history.copy()
             self.save_sessions()
             self.add_to_chat("System", "Samtale gemt! 💾", "system")
         else:
-            messagebox.showwarning("Advarsel", "Ingen aktuel samtale at gemme")
+            messagebox.showwarning("Advarsel", "Ingen valid samtale at gemme")
     
     def delete_session(self):
-        """Slet valgt session"""
+        """Slet valgt session (kun hvis den tilhører brugeren)"""
         selection = self.sessions_listbox.curselection()
         if not selection:
             messagebox.showinfo("Info", "Vælg en samtale at slette")
@@ -279,21 +654,51 @@ class LLMChatGUI:
         session_info = self.sessions_listbox.get(selection[0])
         session_id = session_info.split(" - ")[0]
         
-        if messagebox.askyesno("Bekræft", f"Slet samtale '{self.sessions[session_id]['name']}'?"):
-            del self.sessions[session_id]
-            if self.current_session_id == session_id:
-                self.create_new_session()
-            self.refresh_sessions_list()
-            self.save_sessions()
+        # Sikr at sessionen tilhører denne bruger
+        if (session_id in self.sessions and 
+            self.sessions[session_id].get("user") == self.current_user):
+            if messagebox.askyesno("Bekræft", f"Slet samtale '{self.sessions[session_id]['name']}'?"):
+                del self.sessions[session_id]
+                if self.current_session_id == session_id:
+                    self.create_new_session()
+                self.refresh_sessions_list()
+                self.save_sessions()
+        else:
+            messagebox.showerror("Adgang nægtet", "Du kan ikke slette denne samtale!")
+    
+    def save_sessions(self):
+        """Gem sessions til fil (med bruger data)"""
+        try:
+            # Load eksisterende sessions fra andre brugere
+            all_sessions = {}
+            if os.path.exists(self.sessions_file):
+                try:
+                    with open(self.sessions_file, 'rb') as f:
+                        all_sessions = pickle.load(f)
+                except:
+                    pass
+            
+            # Opdater med denne brugers sessions
+            all_sessions.update(self.sessions)
+            
+            # Gem alt
+            with open(self.sessions_file, 'wb') as f:
+                pickle.dump(all_sessions, f)
+        except Exception as e:
+            print(f"Fejl ved gemning af sessions: {e}")
     
     def refresh_sessions_list(self):
-        """Opdater sessions liste"""
-        # Tjek om GUI er klar
+        """Opdater sessions liste (kun denne brugers)"""
         if not hasattr(self, 'sessions_listbox'):
             return
             
         self.sessions_listbox.delete(0, tk.END)
-        for session_id, session_data in sorted(self.sessions.items(), 
+        
+        # Filtrer og sorter kun denne brugers sessions
+        user_sessions = {k: v for k, v in self.sessions.items() 
+                        if v.get("user") == self.current_user}
+        
+        for session_id, session_data in sorted(user_sessions.items(), 
                                               key=lambda x: x[1]["created"], reverse=True):
             created_str = session_data["created"].strftime("%d/%m %H:%M")
             msg_count = len([msg for msg in session_data["history"] if msg["role"] == "user"])
@@ -302,7 +707,8 @@ class LLMChatGUI:
     
     def update_session_label(self):
         """Opdater session label"""
-        if self.current_session_id and self.current_session_id in self.sessions:
+        if (self.current_session_id and 
+            self.current_session_id in self.sessions):
             name = self.sessions[self.current_session_id]["name"]
             self.session_name_label.config(text=f"📝 Aktuel: {name}")
     
@@ -322,298 +728,7 @@ class LLMChatGUI:
         self.chat_display.delete("1.0", tk.END)
         self.chat_display.config(state=tk.DISABLED)
     
-    # User Profile Management
-    def load_user_profiles(self):
-        """Load alle bruger profiler"""
-        try:
-            if os.path.exists(self.user_profiles_file):
-                with open(self.user_profiles_file, 'r', encoding='utf-8') as f:
-                    self.user_profiles = json.load(f)
-            else:
-                self.user_profiles = {}
-            
-            # Sikr at default profil eksisterer
-            if "default" not in self.user_profiles:
-                self.user_profiles["default"] = {
-                    "personality": "",
-                    "preferences": "",
-                    "interests": "",
-                    "communication_style": "",
-                    "technical_level": "",
-                    "last_updated": ""
-                }
-            
-            # Set current user notes til aktuel profil
-            self.user_notes = self.user_profiles[self.current_user_profile]
-            
-        except Exception as e:
-            print(f"Fejl ved loading af profiler: {e}")
-            self.user_profiles = {
-                "default": {
-                    "personality": "",
-                    "preferences": "",
-                    "interests": "",
-                    "communication_style": "",
-                    "technical_level": "",
-                    "last_updated": ""
-                }
-            }
-            self.user_notes = self.user_profiles["default"]
-    
-    def save_user_profiles(self):
-        """Gem alle bruger profiler"""
-        try:
-            # Opdater aktuel profil før gemning
-            self.user_profiles[self.current_user_profile] = self.user_notes.copy()
-            
-            with open(self.user_profiles_file, 'w', encoding='utf-8') as f:
-                json.dump(self.user_profiles, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            print(f"Fejl ved gemning af profiler: {e}")
-    
-    def create_new_profile(self):
-        """Opret ny bruger profil"""
-        profile_name = simpledialog.askstring("Ny profil", "Navn på ny profil:")
-        if not profile_name or profile_name in self.user_profiles:
-            if profile_name in self.user_profiles:
-                messagebox.showwarning("Advarsel", f"Profil '{profile_name}' eksisterer allerede!")
-            return
-        
-        # Opret ny tom profil
-        self.user_profiles[profile_name] = {
-            "personality": "",
-            "preferences": "",
-            "interests": "",
-            "communication_style": "",
-            "technical_level": "",
-            "last_updated": ""
-        }
-        
-        # Skift til ny profil
-        self.current_user_profile = profile_name
-        self.user_notes = self.user_profiles[profile_name]
-        
-        # Opdater GUI
-        self.refresh_profile_combo()
-        self.profile_var.set(profile_name)
-        self.refresh_notes_display()
-        self.save_user_profiles()
-        
-        self.add_to_chat("System", f"Ny profil '{profile_name}' oprettet og aktiveret! 👤", "system")
-    
-    def delete_profile(self):
-        """Slet bruger profil"""
-        if self.current_user_profile == "default":
-            messagebox.showwarning("Advarsel", "Kan ikke slette 'default' profilen!")
-            return
-        
-        if messagebox.askyesno("Bekræft", f"Slet profil '{self.current_user_profile}' og alle noter?"):
-            del self.user_profiles[self.current_user_profile]
-            
-            # Skift til default
-            self.current_user_profile = "default"
-            self.user_notes = self.user_profiles["default"]
-            
-            # Opdater GUI
-            self.refresh_profile_combo()
-            self.profile_var.set("default")
-            self.refresh_notes_display()
-            self.save_user_profiles()
-            
-            self.add_to_chat("System", "Profil slettet. Skiftet til 'default' profil.", "system")
-    
-    def switch_user_profile(self, event=None):
-        """Skift bruger profil"""
-        new_profile = self.profile_var.get()
-        if new_profile == self.current_user_profile:
-            return
-        
-        # Gem aktuel profil
-        self.user_profiles[self.current_user_profile] = self.user_notes.copy()
-        
-        # Skift til ny profil
-        self.current_user_profile = new_profile
-        self.user_notes = self.user_profiles[new_profile]
-        
-        # Opdater displays
-        self.refresh_notes_display()
-        self.save_user_profiles()
-        
-        self.add_to_chat("System", f"Skiftet til profil: {new_profile} 👤", "system")
-    
-    def refresh_profile_combo(self):
-        """Opdater profil dropdown"""
-        if hasattr(self, 'profile_combo'):
-            profiles = list(self.user_profiles.keys())
-            self.profile_combo['values'] = profiles
-            if self.current_user_profile not in profiles:
-                self.current_user_profile = "default"
-            self.profile_var.set(self.current_user_profile)
-    
-    def update_user_notes(self):
-        """Bed AI om at opdatere bruger noter"""
-        if not self.conversation_history or len(self.conversation_history) < 3:
-            messagebox.showinfo("Info", "For få beskeder til at opdatere noter. Chat lidt mere først!")
-            return
-        
-        # Saml seneste samtale
-        recent_messages = []
-        for msg in self.conversation_history[-10:]:  # Sidste 10 beskeder
-            if msg["role"] in ["user", "assistant"]:
-                recent_messages.append(f"{msg['role']}: {msg['content']}")
-        
-        conversation_text = "\n".join(recent_messages)
-        
-        analysis_prompt = f"""Analyser denne samtale og opdater informationer om brugeren. Du SKAL svare med PRÆCIS dette JSON format - ingen ekstra tekst:
-
-{{
-    "personality": "kort beskrivelse af personlighed",
-    "preferences": "præferencer og valg brugeren viser",
-    "interests": "interesser og emner brugeren engagerer sig i",
-    "communication_style": "hvordan brugeren kommunikerer",
-    "technical_level": "teknisk niveau (begynder/mellemliggende/avanceret)",
-    "last_updated": "{datetime.now().strftime('%Y-%m-%d %H:%M')}"
-}}
-
-Tidligere noter:
-{json.dumps(self.user_notes, ensure_ascii=False)}
-
-Seneste samtale:
-{conversation_text}
-
-VIGTIGT: Svar KUN med valid JSON - ingen forklaring eller ekstra tekst!"""
-        
-        # Send til AI i baggrunden
-        threading.Thread(target=self._get_ai_notes_update, args=(analysis_prompt,), daemon=True).start()
-        self.update_status("🧠 Opdaterer AI noter...")
-    
-    def _get_ai_notes_update(self, prompt):
-        """Få AI til at opdatere noter (baggrund)"""
-        try:
-            headers = {"Content-Type": "application/json"}
-            data = {
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,  # Lavere temperatur for mere konsistente JSON svar
-                "max_tokens": 400,
-                "stream": False
-            }
-            
-            response = requests.post(self.llm_url, json=data, headers=headers, timeout=45)  # Længere timeout
-            response.raise_for_status()
-            result = response.json()
-            
-            ai_response = result['choices'][0]['message']['content'].strip()
-            
-            # Bedre JSON parsing
-            try:
-                # Fjern eventuelle markdown koder og whitespace
-                ai_response = ai_response.replace('```json', '').replace('```', '').strip()
-                
-                # Find JSON start og slut
-                start = ai_response.find('{')
-                end = ai_response.rfind('}') + 1
-                
-                if start >= 0 and end > start:
-                    json_str = ai_response[start:end]
-                    updated_notes = json.loads(json_str)
-                    
-                    # Valider at alle nødvendige felter er der
-                    required_fields = ["personality", "preferences", "interests", "communication_style", "technical_level", "last_updated"]
-                    if all(field in updated_notes for field in required_fields):
-                        # Opdater noter
-                        self.user_notes.update(updated_notes)
-                        self.save_user_profiles()  # Gem til profil system
-                        
-                        # Opdater GUI
-                        self.root.after(0, self._handle_notes_update_success)
-                    else:
-                        self.root.after(0, self._handle_notes_update_error, "Manglende felter i AI svar")
-                else:
-                    self.root.after(0, self._handle_notes_update_error, "Ingen valid JSON fundet")
-                    
-            except json.JSONDecodeError as e:
-                self.root.after(0, self._handle_notes_update_error, f"JSON parse fejl: {str(e)}")
-                
-        except requests.exceptions.Timeout:
-            self.root.after(0, self._handle_notes_update_error, "Timeout - AI'en svarede ikke i tide")
-        except requests.exceptions.ConnectionError:
-            self.root.after(0, self._handle_notes_update_error, "Kan ikke forbinde til LLM")
-        except Exception as e:
-            self.root.after(0, self._handle_notes_update_error, f"Uventet fejl: {str(e)}")
-    
-    def _handle_notes_update_success(self):
-        """Håndter succesfuld note opdatering"""
-        self.refresh_notes_display()
-        self.update_status("✅ AI noter opdateret!")
-        self.add_to_chat("System", "🧠 AI noter om dig er opdateret baseret på samtalen!", "system")
-    
-    def _handle_notes_update_error(self, error):
-        """Håndter note opdatering fejl"""
-        self.update_status("❌ Fejl ved note opdatering")
-        print(f"Note opdatering fejl: {error}")
-    
-    def refresh_notes_display(self):
-        """Opdater noter display"""
-        # Tjek om GUI er klar
-        if not hasattr(self, 'notes_display'):
-            return
-            
-        self.notes_display.config(state=tk.NORMAL)
-        self.notes_display.delete("1.0", tk.END)
-        
-        if any(self.user_notes.values()):
-            notes_text = ""
-            if self.user_notes.get("personality"):
-                notes_text += f"👤 Personlighed: {self.user_notes['personality']}\n\n"
-            if self.user_notes.get("preferences"):
-                notes_text += f"❤️ Præferencer: {self.user_notes['preferences']}\n\n"
-            if self.user_notes.get("interests"):
-                notes_text += f"🎯 Interesser: {self.user_notes['interests']}\n\n"
-            if self.user_notes.get("communication_style"):
-                notes_text += f"💬 Kommunikation: {self.user_notes['communication_style']}\n\n"
-            if self.user_notes.get("technical_level"):
-                notes_text += f"🔧 Teknisk niveau: {self.user_notes['technical_level']}\n\n"
-            if self.user_notes.get("last_updated"):
-                notes_text += f"🕒 Opdateret: {self.user_notes['last_updated']}"
-            
-            self.notes_display.insert("1.0", notes_text)
-        else:
-            self.notes_display.insert("1.0", f"Ingen noter for '{self.current_user_profile}' endnu. Chat med AI'en og klik 'Opdater noter' for at få personlige noter!")
-        
-        self.notes_display.config(state=tk.DISABLED)
-    
-    def show_full_notes(self):
-        """Vis alle noter i nyt vindue"""
-        notes_window = tk.Toplevel(self.root)
-        notes_window.title(f"🧠 Komplette AI Noter - {self.current_user_profile}")
-        notes_window.geometry("600x400")
-        
-        notes_text = scrolledtext.ScrolledText(notes_window, wrap=tk.WORD, font=("Arial", 11))
-        notes_text.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-        
-        full_notes = json.dumps(self.user_notes, ensure_ascii=False, indent=2)
-        notes_text.insert("1.0", full_notes)
-        notes_text.config(state=tk.DISABLED)
-    
-    # Filhåndtering
-    def load_sessions(self):
-        """Load sessions fra fil"""
-        try:
-            if os.path.exists(self.sessions_file):
-                with open(self.sessions_file, 'rb') as f:
-                    self.sessions = pickle.load(f)
-        except:
-            self.sessions = {}
-    
-    def save_sessions(self):
-        """Gem sessions til fil"""
-        try:
-            with open(self.sessions_file, 'wb') as f:
-                pickle.dump(self.sessions, f)
-        except Exception as e:
-            print(f"Fejl ved gemning af sessions: {e}")
-    
-    # Eksisterende metoder (opdateret for session support)
+    # TTS og Speech Recognition
     def init_tts(self):
         """Initialiser TTS engine"""
         try:
@@ -720,37 +835,29 @@ VIGTIGT: Svar KUN med valid JSON - ingen forklaring eller ekstra tekst!"""
         try:
             headers = {"Content-Type": "application/json"}
             
-            # Tilføj bruger noter til system prompt hvis de eksisterer
+            # Byg forbedret system prompt med AI noter
             enhanced_system_prompt = self.system_prompt["content"]
-            if any(self.user_notes.values()):
-                notes_summary = f"\n\nVigtige noter om brugeren:\n"
-                if self.user_notes.get("personality"):
-                    notes_summary += f"- Personlighed: {self.user_notes['personality']}\n"
-                if self.user_notes.get("preferences"):
-                    notes_summary += f"- Præferencer: {self.user_notes['preferences']}\n"
-                if self.user_notes.get("communication_style"):
-                    notes_summary += f"- Kommunikationsstil: {self.user_notes['communication_style']}\n"
-                if self.user_notes.get("technical_level"):
-                    notes_summary += f"- Teknisk niveau: {self.user_notes['technical_level']}\n"
+            notes_summary = self.get_notes_for_ai()
+            if notes_summary:
                 enhanced_system_prompt += notes_summary
             
             # Tilføj til historie
             self.conversation_history.append({"role": "user", "content": prompt})
             
             # Begræns historik og tilføj enhanced system prompt
-            recent_messages = self.conversation_history[-10:]
+            recent_messages = self.conversation_history[-12:]  # Mere historie for bedre kontekst
             messages = [{"role": "system", "content": enhanced_system_prompt}] + [msg for msg in recent_messages if msg["role"] != "system"]
             
             data = {
                 "messages": messages,
                 "temperature": 0.7,
-                "max_tokens": 300,
+                "max_tokens": 400,
                 "stream": False
             }
             
             self.update_status("🤖 Tænker...")
             
-            response = requests.post(self.llm_url, json=data, headers=headers, timeout=30)
+            response = requests.post(self.llm_url, json=data, headers=headers, timeout=35)
             response.raise_for_status()
             result = response.json()
             
@@ -772,6 +879,9 @@ VIGTIGT: Svar KUN med valid JSON - ingen forklaring eller ekstra tekst!"""
         self.add_to_chat("Assistant", response, "assistant")
         self.send_button.config(state=tk.NORMAL, text="📤 Send")
         self.update_status("✅ Klar")
+        
+        # Tjek for automatisk note opdatering
+        self.check_auto_note_update()
         
         # Oplæs hvis aktiveret
         if self.tts_var.get() and self.tts_engine:
@@ -868,12 +978,15 @@ VIGTIGT: Svar KUN med valid JSON - ingen forklaring eller ekstra tekst!"""
     
     def clear_chat(self):
         """Ryd chat historie"""
-        self.conversation_history = [self.system_prompt]
+        self.conversation_history = [self.system_prompt.copy()]
         self.clear_chat_display()
+        self.message_count = 0  # Reset message counter
         self.add_to_chat("System", "Chat ryddet. Start en ny samtale!", "system")
         
         # Opdater session
-        if self.current_session_id and self.current_session_id in self.sessions:
+        if (self.current_session_id and 
+            self.current_session_id in self.sessions and
+            self.sessions[self.current_session_id].get("user") == self.current_user):
             self.sessions[self.current_session_id]["history"] = self.conversation_history.copy()
     
     def run(self):
@@ -887,19 +1000,26 @@ VIGTIGT: Svar KUN med valid JSON - ingen forklaring eller ekstra tekst!"""
     
     def on_closing(self):
         """Håndter lukning af program"""
-        # Gem aktuel session
-        if self.current_session_id and self.current_session_id in self.sessions:
+        # Gem aktuel session (kun hvis den tilhører brugeren)
+        if (self.current_session_id and 
+            self.current_session_id in self.sessions and
+            self.sessions[self.current_session_id].get("user") == self.current_user):
             self.sessions[self.current_session_id]["history"] = self.conversation_history.copy()
         
         # Gem alle data
         self.save_sessions()
-        self.save_user_profiles()
+        self.save_ai_notes()
         
         self.root.destroy()
 
 def main():
     """Hovedfunktion"""
-    print("🚀 Starter LLM Chat GUI med Sessions & AI Noter...")
+    print("🚀 Starter Optimeret LLM Chat GUI...")
+    print("✨ Nye funktioner:")
+    print("  - Automatiske AI noter (løbende)")
+    print("  - Bruger isolation (ingen delte samtaler)")
+    print("  - Forbedret note system med kategorier")
+    print("  - Bedre sikkerhed og performance")
     app = LLMChatGUI()
     app.run()
 
