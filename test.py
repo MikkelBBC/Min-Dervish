@@ -11,6 +11,9 @@ import os
 import pickle
 import hashlib
 import getpass
+import re
+from bs4 import BeautifulSoup
+import queue
 
 class LLMChatGUI:
     def __init__(self, llm_url="http://localhost:1234/v1/chat/completions"):
@@ -31,11 +34,16 @@ class LLMChatGUI:
         self.current_session_id = None
         self.sessions_file = os.path.join(self.user_data_dir, "chat_sessions.pkl")
         
-        # AI Hukommelse system (automatisk og persistent)
+        # AI Hukommelse system (forbedret)
         self.user_memory = {}  # Format: {memory_id: memory_data}
         self.memory_file = os.path.join(self.user_data_dir, "user_memory.json")
         self.auto_memory_threshold = 3  # Antal beskeder før automatisk memory-opdatering
         self.message_count = 0
+        self.auto_memory_job = None
+        
+        # Opskrift søgning
+        self.recipe_search_queue = queue.Queue()
+        self.recipes_data = []
         
         # Load eksisterende data
         self.load_sessions()
@@ -43,10 +51,12 @@ class LLMChatGUI:
         
         # System prompts
         self.danish_prompt = """Du er en hjælpsom assistent der svarer på dansk. Hold svarene korte og præcise. 
-        Du har adgang til information om brugeren som kan hjælpe dig med at give bedre og mere personlige svar."""
+        Du har adgang til information om brugeren som kan hjælpe dig med at give bedre og mere personlige svar.
+        Når brugeren beder om opskrifter, så giv altid mindst én konkret opskrift med ingredienser og fremgangsmåde."""
         
         self.english_prompt = """You are a helpful assistant that always responds in English, even if the user writes in Danish or other languages. 
-        Keep responses concise and clear. You have access to user information that can help you provide better, more personalized responses."""
+        Keep responses concise and clear. You have access to user information that can help you provide better, more personalized responses.
+        When the user asks for recipes, always provide at least one specific recipe with ingredients and instructions."""
         
         self.system_prompt = {
             "role": "system",
@@ -59,6 +69,8 @@ class LLMChatGUI:
         self.recognizer = sr.Recognizer()
         self.microphone = None
         self.is_listening = False
+        self.tts_queue = queue.Queue()
+        self.tts_thread = None
         
         # GUI setup
         self.setup_gui()
@@ -69,17 +81,18 @@ class LLMChatGUI:
         self.init_tts()
         self.init_microphone()
         
+        # Start background threads
+        self.start_tts_worker()
+        self.check_recipe_queue()
+        
         # Test forbindelse ved start
         self.test_connection()
     
     def get_or_create_user(self):
         """Få eller opret bruger ID baseret på system"""
-        # Kombiner username og computer navn for unik ID
         username = getpass.getuser()
         computer_name = os.environ.get('COMPUTERNAME', os.environ.get('HOSTNAME', 'unknown'))
         user_string = f"{username}@{computer_name}"
-        
-        # Lav hash for privatliv
         user_hash = hashlib.md5(user_string.encode()).hexdigest()[:8]
         return user_hash
     
@@ -92,7 +105,7 @@ class LLMChatGUI:
         """Opret GUI vindue"""
         self.root = tk.Tk()
         self.root.title(f"🤖 LLM Chat - Bruger: {self.current_user}")
-        self.root.geometry("1200x800")
+        self.root.geometry("1200x900")
         self.root.configure(bg="#f0f0f0")
         
         # Hovedframe
@@ -155,6 +168,29 @@ class LLMChatGUI:
             fg="black"
         )
         self.chat_display.pack(fill=tk.BOTH, expand=True)
+        
+        # Opskrift søgning område
+        recipe_frame = ttk.LabelFrame(main_frame, text="🍳 Opskrift Søgning", padding="5")
+        recipe_frame.pack(fill=tk.X, pady=(0, 10))
+        
+        recipe_controls = ttk.Frame(recipe_frame)
+        recipe_controls.pack(fill=tk.X)
+        
+        ttk.Label(recipe_controls, text="Søg:").pack(side=tk.LEFT, padx=(0, 5))
+        self.recipe_entry = ttk.Entry(recipe_controls, width=30)
+        self.recipe_entry.pack(side=tk.LEFT, padx=(0, 5))
+        self.recipe_entry.bind('<Return>', lambda e: self.search_recipes())
+        
+        ttk.Button(recipe_controls, text="🔍 Søg Opskrifter", command=self.search_recipes).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(recipe_controls, text="🔊 Læs Opskrift", command=self.read_selected_recipe).pack(side=tk.LEFT)
+        
+        # Progress bar for søgning
+        self.search_progress = ttk.Progressbar(recipe_frame, mode='indeterminate')
+        self.search_progress.pack(fill=tk.X, pady=(5, 0))
+        
+        # Resultat listbox
+        self.recipe_listbox = tk.Listbox(recipe_frame, height=3, font=("Arial", 10))
+        self.recipe_listbox.pack(fill=tk.X, pady=(5, 0))
         
         # Input område
         input_frame = ttk.LabelFrame(main_frame, text="✏️ Skriv besked", padding="5")
@@ -264,38 +300,41 @@ class LLMChatGUI:
         # Tilføj velkomstbesked
         self.add_to_chat("System", f"Velkommen! Du er logget ind som bruger {self.current_user}.\nAI'en husker automatisk information om dig mellem samtaler.\nCtrl+Enter for at sende besked.", "system")
     
-    # Indstillinger vindue
+    # Forbedret indstillinger vindue
     def open_settings(self):
         """Åbn indstillinger vindue"""
         settings_window = tk.Toplevel(self.root)
         settings_window.title("⚙️ Indstillinger")
-        settings_window.geometry("400x300")
+        settings_window.geometry("400x400")
         settings_window.resizable(False, False)
+        
+        # Gem nuværende værdier
+        self.temp_timeout_enabled = tk.BooleanVar(value=self.timeout_enabled)
+        self.temp_timeout_seconds = tk.IntVar(value=self.timeout_seconds)
+        self.temp_auto_memory_threshold = tk.IntVar(value=self.auto_memory_threshold)
         
         # Timeout indstillinger
         timeout_frame = ttk.LabelFrame(settings_window, text="⏱️ Timeout Indstillinger", padding="10")
         timeout_frame.pack(fill=tk.X, padx=10, pady=10)
         
         # Timeout enabled checkbox
-        self.timeout_enabled_var = tk.BooleanVar(value=self.timeout_enabled)
         ttk.Checkbutton(timeout_frame, text="Aktiver timeout", 
-                       variable=self.timeout_enabled_var).pack(anchor=tk.W, pady=(0, 5))
+                       variable=self.temp_timeout_enabled).pack(anchor=tk.W, pady=(0, 5))
         
         # Timeout slider
         ttk.Label(timeout_frame, text="Timeout sekunder:").pack(anchor=tk.W)
         timeout_frame_inner = ttk.Frame(timeout_frame)
         timeout_frame_inner.pack(fill=tk.X, pady=5)
         
-        self.timeout_var = tk.IntVar(value=self.timeout_seconds)
         self.timeout_scale = tk.Scale(timeout_frame_inner, from_=10, to=120, 
-                                     orient=tk.HORIZONTAL, variable=self.timeout_var)
+                                     orient=tk.HORIZONTAL, variable=self.temp_timeout_seconds)
         self.timeout_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
-        self.timeout_label = ttk.Label(timeout_frame_inner, text=f"{self.timeout_seconds}s")
+        self.timeout_label = ttk.Label(timeout_frame_inner, text=f"{self.temp_timeout_seconds.get()}s")
         self.timeout_label.pack(side=tk.RIGHT, padx=(5, 0))
         
         # Bind scale update
-        self.timeout_scale.bind("<Motion>", self.update_timeout_label)
+        self.timeout_scale.bind("<Motion>", lambda e: self.timeout_label.config(text=f"{self.temp_timeout_seconds.get()}s"))
         
         # Auto-hukommelse indstillinger
         memory_frame = ttk.LabelFrame(settings_window, text="🧠 Hukommelse Indstillinger", padding="10")
@@ -305,15 +344,14 @@ class LLMChatGUI:
         memory_threshold_frame = ttk.Frame(memory_frame)
         memory_threshold_frame.pack(fill=tk.X, pady=5)
         
-        self.memory_threshold_var = tk.IntVar(value=self.auto_memory_threshold)
         self.memory_threshold_scale = tk.Scale(memory_threshold_frame, from_=1, to=10, 
-                                              orient=tk.HORIZONTAL, variable=self.memory_threshold_var)
+                                              orient=tk.HORIZONTAL, variable=self.temp_auto_memory_threshold)
         self.memory_threshold_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
-        self.memory_threshold_label = ttk.Label(memory_threshold_frame, text=f"{self.auto_memory_threshold}")
+        self.memory_threshold_label = ttk.Label(memory_threshold_frame, text=f"{self.temp_auto_memory_threshold.get()}")
         self.memory_threshold_label.pack(side=tk.RIGHT, padx=(5, 0))
         
-        self.memory_threshold_scale.bind("<Motion>", self.update_memory_threshold_label)
+        self.memory_threshold_scale.bind("<Motion>", lambda e: self.memory_threshold_label.config(text=f"{self.temp_auto_memory_threshold.get()}"))
         
         # Gem og luk knapper
         button_frame = ttk.Frame(settings_window)
@@ -322,29 +360,34 @@ class LLMChatGUI:
         ttk.Button(button_frame, text="💾 Gem", command=lambda: self.save_settings(settings_window)).pack(side=tk.RIGHT, padx=(5, 0))
         ttk.Button(button_frame, text="❌ Annuller", command=settings_window.destroy).pack(side=tk.RIGHT)
     
-    def update_timeout_label(self, event=None):
-        """Opdater timeout label"""
-        value = self.timeout_var.get()
-        self.timeout_label.config(text=f"{value}s")
-    
-    def update_memory_threshold_label(self, event=None):
-        """Opdater memory threshold label"""
-        value = self.memory_threshold_var.get()
-        self.memory_threshold_label.config(text=f"{value}")
-    
     def save_settings(self, window):
-        """Gem indstillinger"""
-        self.timeout_enabled = self.timeout_enabled_var.get()
-        self.timeout_seconds = self.timeout_var.get()
-        self.auto_memory_threshold = self.memory_threshold_var.get()
+        """Gem indstillinger (nu virker det!)"""
+        # Gem værdierne
+        self.timeout_enabled = self.temp_timeout_enabled.get()
+        self.timeout_seconds = self.temp_timeout_seconds.get()
+        self.auto_memory_threshold = self.temp_auto_memory_threshold.get()
         
         # Reset message counter
         self.message_count = 0
         
+        # Gem til fil
+        settings = {
+            'timeout_enabled': self.timeout_enabled,
+            'timeout_seconds': self.timeout_seconds,
+            'auto_memory_threshold': self.auto_memory_threshold
+        }
+        
+        settings_file = os.path.join(self.user_data_dir, "settings.json")
+        try:
+            with open(settings_file, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2)
+        except Exception as e:
+            print(f"Fejl ved gemning af indstillinger: {e}")
+        
         window.destroy()
         self.add_to_chat("System", f"⚙️ Indstillinger gemt! Timeout: {'ON' if self.timeout_enabled else 'OFF'} ({self.timeout_seconds}s), Hukommelse: hver {self.auto_memory_threshold}. besked", "system")
     
-    # AI Hukommelse System (Forenklet og automatisk)
+    # Forbedret AI Hukommelse System
     def load_user_memory(self):
         """Load bruger hukommelse fra fil"""
         try:
@@ -382,11 +425,11 @@ class LLMChatGUI:
             threading.Thread(target=self._auto_update_memory, daemon=True).start()
     
     def _auto_update_memory(self):
-        """Automatisk opdatering af hukommelse (baggrund)"""
+        """Forbedret automatisk opdatering af hukommelse"""
         try:
             # Saml seneste beskeder til analyse
             recent_messages = []
-            for msg in self.conversation_history[-4:]:  # Sidste 4 beskeder
+            for msg in self.conversation_history[-6:]:  # Sidste 6 beskeder for bedre kontekst
                 if msg["role"] in ["user", "assistant"]:
                     recent_messages.append(f"{msg['role']}: {msg['content']}")
             
@@ -395,28 +438,40 @@ class LLMChatGUI:
             
             conversation_text = "\n".join(recent_messages)
             
-            # Fokuseret prompt for at fange interessante information
-            analysis_prompt = f"""Analyser denne samtale og find interessant information om brugeren som jeg skal huske.
+            # Forbedret prompt for at fange personlig information
+            analysis_prompt = f"""Analyser denne samtale og find AL personlig information om brugeren.
 
 SAMTALE:
 {conversation_text}
 
-Find ALLE interessante facts om personen - navn, hobbier, præferencer, job, familie, mål, problemer, etc.
+Find og returner i JSON format:
+1. Navn (fx "Mikkel")
+2. Alder (fx 21)
+3. Lokation/by
+4. Job/uddannelse
+5. Interesser/hobbyer
+6. Familie info
+7. Præferencer (mad, aktiviteter, etc.)
+8. Andre vigtige fakta
 
-Svar med JSON:
+VIGTIGT: Returner KUN ren JSON, ingen anden tekst!
+
+JSON struktur:
 {{
     "memories": [
-        {{"info": "konkret fact om personen", "importance": 1-10}}
+        {{"category": "navn", "info": "Mikkel", "importance": 10}},
+        {{"category": "alder", "info": "21 år", "importance": 9}},
+        {{"category": "andet", "info": "beskrivelse", "importance": 1-10}}
     ]
 }}
 
-Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
+Hvis ingen ny info, returner: {{"memories": []}}"""
             
             headers = {"Content-Type": "application/json"}
             data = {
                 "messages": [{"role": "user", "content": analysis_prompt}],
                 "temperature": 0.1,
-                "max_tokens": 300,
+                "max_tokens": 500,
                 "stream": False
             }
             
@@ -429,66 +484,108 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
             
             ai_response = result['choices'][0]['message']['content'].strip()
             
-            # Parse JSON respons
-            try:
-                ai_response = ai_response.replace('```json', '').replace('```', '').strip()
-                start = ai_response.find('{')
-                end = ai_response.rfind('}') + 1
+            # Forbedret JSON parsing
+            memory_updates = self.parse_json_response(ai_response)
+            
+            if memory_updates and "memories" in memory_updates:
+                new_count = 0
+                for memory_data in memory_updates["memories"]:
+                    if memory_data.get("info") and memory_data.get("importance", 0) >= 5:
+                        memory_id = str(int(time.time() * 1000))
+                        
+                        # Check for duplikater
+                        if not self._memory_exists(memory_data["info"]):
+                            self.user_memory[memory_id] = {
+                                "category": memory_data.get("category", "general"),
+                                "info": memory_data["info"],
+                                "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                                "importance": memory_data.get("importance", 5)
+                            }
+                            new_count += 1
                 
-                if start >= 0 and end > start:
-                    json_str = ai_response[start:end]
-                    memory_updates = json.loads(json_str)
+                if new_count > 0:
+                    self.save_user_memory()
+                    self.root.after(0, self._handle_auto_memory_success, new_count)
+                else:
+                    self.root.after(0, lambda: self.auto_memory_label.config(text="🤖 Ingen nye minder denne gang"))
+                    self.root.after(3000, lambda: self.auto_memory_label.config(text="🤖 Auto-hukommelse: Aktiveret"))
                     
-                    # Tilføj nye minder
-                    new_count = 0
-                    if "memories" in memory_updates:
-                        for memory_data in memory_updates["memories"]:
-                            importance = memory_data.get("importance", 0)
-                            if importance >= 5:  # Kun vigtige minder
-                                info = memory_data.get("info", "")
-                                
-                                if info and not self._memory_exists(info):
-                                    memory_id = str(int(time.time() * 1000))
-                                    self.user_memory[memory_id] = {
-                                        "info": info,
-                                        "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                        "importance": importance
-                                    }
-                                    new_count += 1
-                    
-                    # Gem og opdater GUI hvis der er nye minder
-                    if new_count > 0:
-                        self.save_user_memory()
-                        self.root.after(0, self._handle_auto_memory_success, new_count)
-                    else:
-                        # Vis at systemet kører, selvom ingen nye minder
-                        self.root.after(0, lambda: self.auto_memory_label.config(text="🤖 Ingen nye minder denne gang"))
-                        self.root.after(3000, lambda: self.auto_memory_label.config(text="🤖 Auto-hukommelse: Aktiveret"))
-                    
-            except json.JSONDecodeError as e:
-                print(f"Auto-hukommelse JSON fejl: {e}")
-                self.root.after(0, lambda: self.auto_memory_label.config(text="❌ Hukommelse JSON fejl"))
-                
-        except requests.exceptions.Timeout:
-            print("Auto-hukommelse timeout")
-            self.root.after(0, lambda: self.auto_memory_label.config(text="⏱️ Hukommelse timeout (juster i indstillinger)"))
-            self.root.after(5000, lambda: self.auto_memory_label.config(text="🤖 Auto-hukommelse: Aktiveret"))
-        except requests.exceptions.ConnectionError:
-            print("Auto-hukommelse forbindelse fejl")
-            self.root.after(0, lambda: self.auto_memory_label.config(text="❌ LLM ikke tilgængelig"))
         except Exception as e:
-            print(f"Auto-hukommelse generel fejl: {e}")
+            print(f"Auto-hukommelse fejl: {e}")
             self.root.after(0, lambda: self.auto_memory_label.config(text="❌ Hukommelse fejl"))
+    
+    def parse_json_response(self, response_text):
+        """Robust JSON parsing med flere metoder"""
+        # Metode 1: Direkte parsing
+        try:
+            return json.loads(response_text)
+        except json.JSONDecodeError:
+            pass
+        
+        # Metode 2: Find JSON i tekst
+        try:
+            # Fjern markdown code blocks
+            cleaned = response_text.replace('```json', '').replace('```', '').strip()
+            
+            # Find JSON mellem krølparenteser
+            json_match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+        except:
+            pass
+        
+        # Metode 3: Manuel extraction som fallback
+        try:
+            memories = []
+            
+            # Søg efter navn
+            name_patterns = [
+                r'(?:jeg hedder|mit navn er|jeg er)\s+(\w+)',
+                r'navn["\s:]+(\w+)',
+                r'"name"[:\s]+"(\w+)"'
+            ]
+            for pattern in name_patterns:
+                match = re.search(pattern, response_text, re.IGNORECASE)
+                if match:
+                    memories.append({
+                        "category": "navn",
+                        "info": match.group(1),
+                        "importance": 10
+                    })
+                    break
+            
+            # Søg efter alder
+            age_patterns = [
+                r'(\d+)\s*år',
+                r'alder["\s:]+(\d+)',
+                r'"age"[:\s]+(\d+)'
+            ]
+            for pattern in age_patterns:
+                match = re.search(pattern, response_text, re.IGNORECASE)
+                if match:
+                    memories.append({
+                        "category": "alder",
+                        "info": f"{match.group(1)} år",
+                        "importance": 9
+                    })
+                    break
+            
+            if memories:
+                return {"memories": memories}
+        except:
+            pass
+        
+        return None
     
     def _memory_exists(self, new_info):
         """Tjek om lignende hukommelse allerede eksisterer"""
         new_info_lower = new_info.lower()
         for memory_data in self.user_memory.values():
             existing_info = memory_data.get("info", "").lower()
-            # Simpel check for overlap (kan forbedres)
-            if len(new_info_lower) > 10 and new_info_lower in existing_info:
+            # Simpel check for overlap
+            if len(new_info_lower) > 5 and new_info_lower in existing_info:
                 return True
-            if len(existing_info) > 10 and existing_info in new_info_lower:
+            if len(existing_info) > 5 and existing_info in new_info_lower:
                 return True
         return False
     
@@ -522,22 +619,33 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
         self.memory_display.delete("1.0", tk.END)
         
         if self.user_memory:
-            # Sorter efter vigtighed og dato
+            # Sorter efter vigtighed og kategori
             sorted_memories = sorted(self.user_memory.items(), 
-                                   key=lambda x: (x[1].get("importance", 0), x[1].get("created", "")), 
+                                   key=lambda x: (x[1].get("importance", 0), x[1].get("category", "")), 
                                    reverse=True)
             
-            for memory_id, memory_data in sorted_memories[:10]:  # Vis top 10
-                info = memory_data.get("info", "")
-                importance = memory_data.get("importance", 0)
-                created = memory_data.get("created", "")
-                
-                stars = "⭐" * min(importance, 5)  # Max 5 stjerner visuel
-                self.memory_display.insert(tk.END, f"• {info} {stars}\n")
-                self.memory_display.insert(tk.END, f"  📅 {created}\n\n")
+            # Grupper efter kategori
+            categories = {}
+            for memory_id, memory_data in sorted_memories:
+                category = memory_data.get("category", "andet")
+                if category not in categories:
+                    categories[category] = []
+                categories[category].append(memory_data)
+            
+            # Vis grupperet
+            for category, memories in categories.items():
+                self.memory_display.insert(tk.END, f"📌 {category.upper()}:\n", "category")
+                for memory in memories[:3]:  # Max 3 per kategori
+                    info = memory.get("info", "")
+                    importance = memory.get("importance", 0)
+                    stars = "⭐" * min(importance // 2, 5)
+                    self.memory_display.insert(tk.END, f"  • {info} {stars}\n")
+                self.memory_display.insert(tk.END, "\n")
         else:
             self.memory_display.insert(tk.END, "Ingen minder endnu.\n\nChat med AI'en og den vil automatisk huske interessant information om dig!")
         
+        # Styling
+        self.memory_display.tag_config("category", foreground="darkblue", font=("Arial", 10, "bold"))
         self.memory_display.config(state=tk.DISABLED)
     
     def show_all_memory(self):
@@ -546,7 +654,7 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
         memory_window.title(f"🧠 Alle Minder - Bruger: {self.current_user}")
         memory_window.geometry("700x500")
         
-        # Sorter efter vigtighed
+        # Sorter og filter controls
         controls_frame = ttk.Frame(memory_window)
         controls_frame.pack(fill=tk.X, padx=10, pady=5)
         
@@ -554,7 +662,7 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
         
         sort_var = tk.StringVar(value="Vigtighed")
         sort_combo = ttk.Combobox(controls_frame, textvariable=sort_var, 
-                                 values=["Vigtighed", "Dato (nyeste)", "Dato (ældste)"], 
+                                 values=["Vigtighed", "Kategori", "Dato (nyeste)", "Dato (ældste)"], 
                                  state="readonly", width=15)
         sort_combo.pack(side=tk.LEFT, padx=(0, 10))
         
@@ -575,6 +683,9 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
             if sort_choice == "Vigtighed":
                 sorted_memories = sorted(self.user_memory.items(), 
                                        key=lambda x: x[1].get("importance", 0), reverse=True)
+            elif sort_choice == "Kategori":
+                sorted_memories = sorted(self.user_memory.items(), 
+                                       key=lambda x: x[1].get("category", ""))
             elif sort_choice == "Dato (nyeste)":
                 sorted_memories = sorted(self.user_memory.items(), 
                                        key=lambda x: x[1].get("created", ""), reverse=True)
@@ -583,12 +694,13 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
                                        key=lambda x: x[1].get("created", ""))
             
             for i, (memory_id, memory_data) in enumerate(sorted_memories, 1):
+                category = memory_data.get("category", "andet")
                 info = memory_data.get("info", "")
                 importance = memory_data.get("importance", 0)
                 created = memory_data.get("created", "Ukendt")
                 
                 stars = "⭐" * importance
-                text_widget.insert(tk.END, f"{i}. {info}\n")
+                text_widget.insert(tk.END, f"{i}. [{category}] {info}\n")
                 text_widget.insert(tk.END, f"   Vigtighed: {stars} ({importance}/10)\n")
                 text_widget.insert(tk.END, f"   📅 Oprettet: {created}\n")
                 text_widget.insert(tk.END, f"   🆔 ID: {memory_id}\n\n")
@@ -629,20 +741,211 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
         if not self.user_memory:
             return ""
         
-        memory_summary = "\n\nVigtig information om brugeren (brug til at give bedre svar):\n"
+        memory_summary = "\n\nBruger information (brug dette til personlige svar):\n"
         
-        # Få de mest vigtige minder
-        sorted_memories = sorted(self.user_memory.items(), 
-                               key=lambda x: x[1].get("importance", 0), reverse=True)
+        # Organiser efter kategori
+        categories = {}
+        for memory_data in self.user_memory.values():
+            category = memory_data.get("category", "andet")
+            if category not in categories:
+                categories[category] = []
+            categories[category].append(memory_data.get("info", ""))
         
-        for memory_id, memory_data in sorted_memories[:8]:  # Top 8 vigtigste minder
-            info = memory_data.get("info", "")
-            if info:
-                memory_summary += f"- {info}\n"
+        # Byg summary
+        for category, infos in categories.items():
+            if infos:
+                memory_summary += f"{category}: {', '.join(infos)}\n"
         
         return memory_summary
     
-    # Session Management (forbedret med bruger isolation)
+    # Opskrift søgning funktioner
+    def search_recipes(self):
+        """Start opskrift søgning"""
+        query = self.recipe_entry.get().strip()
+        if not query:
+            messagebox.showwarning("Advarsel", "Indtast hvad du vil søge efter (fx 'pandekager')")
+            return
+        
+        # Start progress bar
+        self.search_progress.start()
+        self.recipe_listbox.delete(0, tk.END)
+        self.recipe_listbox.insert(0, "Søger...")
+        
+        # Søg i baggrunden
+        threading.Thread(target=self._search_recipes_worker, args=(query,), daemon=True).start()
+    
+    def _search_recipes_worker(self, query):
+        """Søg efter opskrifter (kører i baggrunden)"""
+        try:
+            # Metode 1: Brug TheMealDB API
+            results = self.search_themealdb(query)
+            
+            # Metode 2: Hvis ingen resultater, prøv en generisk søgning
+            if not results:
+                results = self.search_generic_recipes(query)
+            
+            self.recipe_search_queue.put(('success', results))
+            
+        except Exception as e:
+            self.recipe_search_queue.put(('error', str(e)))
+    
+    def search_themealdb(self, query):
+        """Søg i TheMealDB API"""
+        try:
+            url = f"https://www.themealdb.com/api/json/v1/1/search.php?s={query}"
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            results = []
+            
+            if data.get('meals'):
+                for meal in data['meals'][:5]:  # Max 5 resultater
+                    # Saml ingredienser
+                    ingredients = []
+                    for i in range(1, 21):
+                        ingredient = meal.get(f'strIngredient{i}', '').strip()
+                        measure = meal.get(f'strMeasure{i}', '').strip()
+                        
+                        if ingredient:
+                            if measure:
+                                ingredients.append(f"{measure} {ingredient}")
+                            else:
+                                ingredients.append(ingredient)
+                    
+                    recipe = {
+                        'title': meal.get('strMeal', 'Ukendt opskrift'),
+                        'ingredients': ingredients,
+                        'instructions': meal.get('strInstructions', ''),
+                        'category': meal.get('strCategory', ''),
+                        'source': 'TheMealDB'
+                    }
+                    results.append(recipe)
+            
+            return results
+            
+        except Exception as e:
+            print(f"TheMealDB fejl: {e}")
+            return []
+    
+    def search_generic_recipes(self, query):
+        """Generisk opskrift søgning som fallback"""
+        # Her kan du implementere andre API'er eller web scraping
+        # For nu returnerer vi nogle eksempel opskrifter
+        
+        example_recipes = {
+            'pandekager': [{
+                'title': 'Klassiske Pandekager',
+                'ingredients': [
+                    '3 dl hvedemel',
+                    '5 dl mælk',
+                    '3 æg',
+                    '1 spsk sukker',
+                    '1 tsk salt',
+                    'Smør til stegning'
+                ],
+                'instructions': '1. Pisk mel og halvdelen af mælken sammen til en jævn dej. 2. Tilsæt resten af mælken, æg, sukker og salt. 3. Lad dejen hvile 30 min. 4. Steg tynde pandekager på en varm pande med smør.',
+                'category': 'Dessert',
+                'source': 'Lokal database'
+            }],
+            'pasta': [{
+                'title': 'Pasta Carbonara',
+                'ingredients': [
+                    '400g spaghetti',
+                    '200g bacon',
+                    '3 æggeblommer',
+                    '1 dl fløde',
+                    '100g parmesan',
+                    'Salt og peber'
+                ],
+                'instructions': '1. Kog pasta. 2. Steg bacon sprødt. 3. Pisk æggeblommer, fløde og revet parmesan sammen. 4. Bland den varme pasta med bacon og æggeblandingen. 5. Server straks.',
+                'category': 'Hovedret',
+                'source': 'Lokal database'
+            }]
+        }
+        
+        # Find matchende opskrifter
+        query_lower = query.lower()
+        for key, recipes in example_recipes.items():
+            if key in query_lower or query_lower in key:
+                return recipes
+        
+        return []
+    
+    def check_recipe_queue(self):
+        """Check for opskrift søgeresultater"""
+        try:
+            while True:
+                result_type, data = self.recipe_search_queue.get_nowait()
+                
+                # Stop progress bar
+                self.search_progress.stop()
+                
+                if result_type == 'success':
+                    self.display_recipes(data)
+                else:
+                    self.recipe_listbox.delete(0, tk.END)
+                    self.recipe_listbox.insert(0, f"Fejl: {data}")
+        except queue.Empty:
+            pass
+        
+        # Check igen om 100ms
+        self.root.after(100, self.check_recipe_queue)
+    
+    def display_recipes(self, recipes):
+        """Vis opskrift resultater"""
+        self.recipe_listbox.delete(0, tk.END)
+        self.recipes_data = recipes
+        
+        if recipes:
+            for i, recipe in enumerate(recipes):
+                title = recipe['title']
+                category = recipe.get('category', '')
+                if category:
+                    display_text = f"{title} ({category})"
+                else:
+                    display_text = title
+                self.recipe_listbox.insert(tk.END, display_text)
+        else:
+            self.recipe_listbox.insert(0, "Ingen opskrifter fundet")
+    
+    def read_selected_recipe(self):
+        """Læs valgt opskrift højt"""
+        selection = self.recipe_listbox.curselection()
+        if not selection:
+            messagebox.showwarning("Advarsel", "Vælg en opskrift først")
+            return
+        
+        if not self.recipes_data:
+            return
+        
+        recipe = self.recipes_data[selection[0]]
+        
+        # Format opskrift til oplæsning
+        text = f"Opskrift på {recipe['title']}. "
+        
+        if recipe.get('category'):
+            text += f"Kategori: {recipe['category']}. "
+        
+        if recipe['ingredients']:
+            text += "Ingredienser: "
+            for ingredient in recipe['ingredients']:
+                text += f"{ingredient}. "
+        
+        if recipe['instructions']:
+            text += "Fremgangsmåde: "
+            # Rens instruktioner
+            instructions = recipe['instructions'].replace('\r\n', '. ').replace('\n', '. ')
+            text += instructions
+        
+        # Send til TTS
+        if self.tts_var.get():
+            self.speak_text(text)
+        
+        # Vis også i chat
+        self.add_to_chat("Opskrift", text, "system")
+    
+    # Session Management
     def create_new_session(self):
         """Opret ny session"""
         if not hasattr(self, 'sessions_listbox'):
@@ -653,24 +956,23 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
             if not session_name:
                 return
         
-        session_id = f"{self.current_user}_{int(time.time())}"  # Bruger-specifik ID
+        session_id = f"{self.current_user}_{int(time.time())}"
         self.sessions[session_id] = {
             "name": session_name,
             "history": [self.system_prompt.copy()],
             "created": datetime.now(),
-            "user": self.current_user  # Sikr bruger tilhørighed
+            "user": self.current_user
         }
         
         self.current_session_id = session_id
         self.conversation_history = self.sessions[session_id]["history"]
-        self.message_count = 0  # Reset message counter
+        self.message_count = 0
         
         if hasattr(self, 'sessions_listbox'):
             self.refresh_sessions_list()
             self.clear_chat_display()
             self.update_session_label()
             
-            # Vis hvor mange minder AI'en allerede har
             memory_count = len(self.user_memory)
             if memory_count > 0:
                 self.add_to_chat("System", f"Ny samtale '{session_name}' oprettet! AI'en husker allerede {memory_count} ting om dig.", "system")
@@ -683,7 +985,6 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
             if os.path.exists(self.sessions_file):
                 with open(self.sessions_file, 'rb') as f:
                     all_sessions = pickle.load(f)
-                    # Filtrer kun denne brugers sessions
                     self.sessions = {k: v for k, v in all_sessions.items() 
                                    if v.get("user") == self.current_user}
             else:
@@ -692,7 +993,7 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
             self.sessions = {}
     
     def load_selected_session(self, event=None):
-        """Load valgt session (kun hvis den tilhører brugeren)"""
+        """Load valgt session"""
         selection = self.sessions_listbox.curselection()
         if not selection:
             return
@@ -700,14 +1001,13 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
         session_info = self.sessions_listbox.get(selection[0])
         session_id = session_info.split(" - ")[0]
         
-        # Sikr at sessionen tilhører denne bruger
         if (session_id in self.sessions and 
             self.sessions[session_id].get("user") == self.current_user):
             self.current_session_id = session_id
             self.conversation_history = self.sessions[session_id]["history"]
             self.refresh_chat_from_history()
             self.update_session_label()
-            self.message_count = 0  # Reset counter for loaded session
+            self.message_count = 0
         else:
             messagebox.showerror("Adgang nægtet", "Du har ikke adgang til denne samtale!")
     
@@ -723,7 +1023,7 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
             messagebox.showwarning("Advarsel", "Ingen valid samtale at gemme")
     
     def delete_session(self):
-        """Slet valgt session (kun hvis den tilhører brugeren)"""
+        """Slet valgt session"""
         selection = self.sessions_listbox.curselection()
         if not selection:
             messagebox.showinfo("Info", "Vælg en samtale at slette")
@@ -732,7 +1032,6 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
         session_info = self.sessions_listbox.get(selection[0])
         session_id = session_info.split(" - ")[0]
         
-        # Sikr at sessionen tilhører denne bruger
         if (session_id in self.sessions and 
             self.sessions[session_id].get("user") == self.current_user):
             if messagebox.askyesno("Bekræft", f"Slet samtale '{self.sessions[session_id]['name']}'?"):
@@ -745,9 +1044,8 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
             messagebox.showerror("Adgang nægtet", "Du kan ikke slette denne samtale!")
     
     def save_sessions(self):
-        """Gem sessions til fil (med bruger data)"""
+        """Gem sessions til fil"""
         try:
-            # Load eksisterende sessions fra andre brugere
             all_sessions = {}
             if os.path.exists(self.sessions_file):
                 try:
@@ -756,23 +1054,20 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
                 except:
                     pass
             
-            # Opdater med denne brugers sessions
             all_sessions.update(self.sessions)
             
-            # Gem alt
             with open(self.sessions_file, 'wb') as f:
                 pickle.dump(all_sessions, f)
         except Exception as e:
             print(f"Fejl ved gemning af sessions: {e}")
     
     def refresh_sessions_list(self):
-        """Opdater sessions liste (kun denne brugers)"""
+        """Opdater sessions liste"""
         if not hasattr(self, 'sessions_listbox'):
             return
             
         self.sessions_listbox.delete(0, tk.END)
         
-        # Filtrer og sorter kun denne brugers sessions
         user_sessions = {k: v for k, v in self.sessions.items() 
                         if v.get("user") == self.current_user}
         
@@ -811,7 +1106,7 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
         """Initialiser TTS engine"""
         try:
             self.tts_engine = pyttsx3.init()
-            self.tts_engine.setProperty('rate', 150)
+            self.tts_engine.setProperty('rate', 130)
             self.tts_engine.setProperty('volume', 0.9)
             
             # Prøv at finde dansk stemme
@@ -836,6 +1131,55 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
         except Exception as e:
             self.update_status(f"❌ Mikrofon fejl: {str(e)[:30]}")
             self.microphone = None
+    
+    def start_tts_worker(self):
+        """Start TTS worker thread"""
+        self.tts_thread = threading.Thread(target=self.tts_worker, daemon=True)
+        self.tts_thread.start()
+    
+    def tts_worker(self):
+        """TTS worker der processer queue"""
+        while True:
+            try:
+                text = self.tts_queue.get(timeout=1)
+                if text and self.tts_engine and self.tts_var.get():
+                    # Rens tekst
+                    clean_text = self.clean_text_for_speech(text)
+                    self.tts_engine.say(clean_text)
+                    self.tts_engine.runAndWait()
+                self.tts_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"TTS fejl: {e}")
+    
+    def clean_text_for_speech(self, text):
+        """Rens tekst til bedre udtale"""
+        # Fjern emojis og specielle tegn
+        text = re.sub(r'[^\w\s\.\,\!\?\-\:]', ' ', text)
+        
+        # Erstat forkortelser
+        replacements = {
+            'fx': 'for eksempel',
+            'osv': 'og så videre',
+            'ml': 'milliliter',
+            'dl': 'deciliter',
+            'kg': 'kilogram',
+            'g': 'gram',
+            'tsk': 'teske',
+            'spsk': 'spisske',
+            '°C': 'grader celsius'
+        }
+        
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+        
+        return text
+    
+    def speak_text(self, text):
+        """Send tekst til TTS queue"""
+        if text and self.tts_engine:
+            self.tts_queue.put(text)
     
     def test_connection(self):
         """Test LLM forbindelse"""
@@ -923,13 +1267,13 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
             self.conversation_history.append({"role": "user", "content": prompt})
             
             # Begræns historik og tilføj enhanced system prompt
-            recent_messages = self.conversation_history[-12:]  # Mere historie for bedre kontekst
+            recent_messages = self.conversation_history[-12:]
             messages = [{"role": "system", "content": enhanced_system_prompt}] + [msg for msg in recent_messages if msg["role"] != "system"]
             
             data = {
                 "messages": messages,
                 "temperature": 0.7,
-                "max_tokens": 400,
+                "max_tokens": 800,
                 "stream": False
             }
             
@@ -969,7 +1313,7 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
         
         # Oplæs hvis aktiveret
         if self.tts_var.get() and self.tts_engine:
-            threading.Thread(target=self._speak, args=(response,), daemon=True).start()
+            self.speak_text(response)
     
     def _handle_llm_error(self, error_msg):
         """Håndter LLM fejl (kører i main thread)"""
@@ -980,15 +1324,6 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
         # Fjern sidste brugerbesked ved fejl
         if self.conversation_history and self.conversation_history[-1]["role"] == "user":
             self.conversation_history.pop()
-    
-    def _speak(self, text):
-        """Oplæs tekst (kører i baggrunden)"""
-        try:
-            if self.tts_engine and text.strip():
-                self.tts_engine.say(text)
-                self.tts_engine.runAndWait()
-        except Exception as e:
-            print(f"TTS fejl: {e}")
     
     def toggle_voice_input(self):
         """Toggle stemme input"""
@@ -1040,17 +1375,14 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
     def toggle_english_response(self):
         """Toggle engelsk respons mode"""
         if self.english_var.get():
-            # Skift til engelsk system prompt
             self.system_prompt["content"] = self.english_prompt
             self.update_status("🇬🇧 Engelsk svar: TIL")
             self.add_to_chat("System", "Modellen vil nu svare på engelsk selvom du skriver dansk.", "system")
         else:
-            # Skift tilbage til dansk system prompt
             self.system_prompt["content"] = self.danish_prompt
             self.update_status("🇩🇰 Dansk svar: TIL")
             self.add_to_chat("System", "Modellen vil nu svare på dansk igen.", "system")
         
-        # Opdater system prompt i samtale historik
         if self.conversation_history and self.conversation_history[0]["role"] == "system":
             self.conversation_history[0] = self.system_prompt.copy()
     
@@ -1064,16 +1396,14 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
         """Ryd chat historie"""
         self.conversation_history = [self.system_prompt.copy()]
         self.clear_chat_display()
-        self.message_count = 0  # Reset message counter
+        self.message_count = 0
         
-        # Vis eksisterende minder når chat ryddes
         memory_count = len(self.user_memory)
         if memory_count > 0:
             self.add_to_chat("System", f"Chat ryddet. AI'en husker stadig {memory_count} ting om dig! Start en ny samtale.", "system")
         else:
             self.add_to_chat("System", "Chat ryddet. Start en ny samtale!", "system")
         
-        # Opdater session
         if (self.current_session_id and 
             self.current_session_id in self.sessions and
             self.sessions[self.current_session_id].get("user") == self.current_user):
@@ -1082,7 +1412,6 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
     def run(self):
         """Start GUI"""
         try:
-            # Gem sessions når programmet lukkes
             self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
             self.root.mainloop()
         except KeyboardInterrupt:
@@ -1090,13 +1419,11 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
     
     def on_closing(self):
         """Håndter lukning af program"""
-        # Gem aktuel session (kun hvis den tilhører brugeren)
         if (self.current_session_id and 
             self.current_session_id in self.sessions and
             self.sessions[self.current_session_id].get("user") == self.current_user):
             self.sessions[self.current_session_id]["history"] = self.conversation_history.copy()
         
-        # Gem alle data
         self.save_sessions()
         self.save_user_memory()
         
@@ -1104,14 +1431,14 @@ Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
 
 def main():
     """Hovedfunktion"""
-    print("🚀 Starter Optimeret LLM Chat GUI...")
-    print("✨ Nye funktioner:")
-    print("  - Konfigurerbar timeout (10-120 sekunder)")
-    print("  - Kan slå timeout helt fra")
-    print("  - Automatisk AI hukommelse (ingen kategorier)")
-    print("  - Permanent hukommelse på tværs af samtaler")
-    print("  - Indstillinger menu (⚙️)")
-    print("  - Bruger isolation (sikre samtaler)")
+    print("🚀 Starter Forbedret LLM Chat GUI...")
+    print("✨ Nye forbedringer:")
+    print("  - Bedre hukommelse system der fanger personlig info")
+    print("  - Fungerende indstillinger")
+    print("  - Opskrift søgning med oplæsning")
+    print("  - Robust JSON parsing")
+    print("  - Forbedret TTS system")
+    print("  - Organiseret hukommelse visning")
     app = LLMChatGUI()
     app.run()
 
