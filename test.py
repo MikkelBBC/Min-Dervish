@@ -17,6 +17,10 @@ class LLMChatGUI:
         # LLM URL
         self.llm_url = llm_url
         
+        # Konfigurerbare indstillinger
+        self.timeout_seconds = 45  # Standard timeout
+        self.timeout_enabled = True  # Om timeout er aktiveret
+        
         # Bruger identifikation
         self.current_user = self.get_or_create_user()
         self.user_data_dir = f"user_data_{self.current_user}"
@@ -27,22 +31,22 @@ class LLMChatGUI:
         self.current_session_id = None
         self.sessions_file = os.path.join(self.user_data_dir, "chat_sessions.pkl")
         
-        # AI Noter system (løbende og automatisk)
-        self.ai_notes = {}  # Format: {kategori: {note_id: note_data}}
-        self.notes_file = os.path.join(self.user_data_dir, "ai_notes.json")
-        self.auto_note_threshold = 3  # Antal beskeder før automatisk note-opdatering
+        # AI Hukommelse system (automatisk og persistent)
+        self.user_memory = {}  # Format: {memory_id: memory_data}
+        self.memory_file = os.path.join(self.user_data_dir, "user_memory.json")
+        self.auto_memory_threshold = 3  # Antal beskeder før automatisk memory-opdatering
         self.message_count = 0
         
         # Load eksisterende data
         self.load_sessions()
-        self.load_ai_notes()
+        self.load_user_memory()
         
         # System prompts
         self.danish_prompt = """Du er en hjælpsom assistent der svarer på dansk. Hold svarene korte og præcise. 
-        Du har adgang til noter om brugeren som kan hjælpe dig med at give bedre og mere personlige svar."""
+        Du har adgang til information om brugeren som kan hjælpe dig med at give bedre og mere personlige svar."""
         
         self.english_prompt = """You are a helpful assistant that always responds in English, even if the user writes in Danish or other languages. 
-        Keep responses concise and clear. You have access to user notes that can help you provide better, more personalized responses."""
+        Keep responses concise and clear. You have access to user information that can help you provide better, more personalized responses."""
         
         self.system_prompt = {
             "role": "system",
@@ -95,7 +99,7 @@ class LLMChatGUI:
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
         
-        # Top panel med sessions og AI noter
+        # Top panel med sessions og hukommelse
         top_panel = ttk.Frame(main_frame)
         top_panel.pack(fill=tk.X, pady=(0, 10))
         
@@ -115,39 +119,28 @@ class LLMChatGUI:
         self.sessions_listbox.pack(fill=tk.BOTH, expand=True)
         self.sessions_listbox.bind('<Double-Button-1>', self.load_selected_session)
         
-        # AI Noter panel (højre) - Nu med kategorier
-        notes_frame = ttk.LabelFrame(top_panel, text="🧠 AI Noter (Automatiske)", padding="5")
-        notes_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
+        # AI Hukommelse panel (højre)
+        memory_frame = ttk.LabelFrame(top_panel, text="🧠 AI Hukommelse (Permanent)", padding="5")
+        memory_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(5, 0))
         
-        # Noter controls
-        notes_controls = ttk.Frame(notes_frame)
-        notes_controls.pack(fill=tk.X, pady=(0, 5))
+        # Hukommelse controls
+        memory_controls = ttk.Frame(memory_frame)
+        memory_controls.pack(fill=tk.X, pady=(0, 5))
         
-        ttk.Button(notes_controls, text="🔄 Opdater nu", command=self.force_update_notes, width=12).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(notes_controls, text="👁️ Alle noter", command=self.show_all_notes, width=10).pack(side=tk.LEFT, padx=(0, 5))
-        ttk.Button(notes_controls, text="🧹 Ryd noter", command=self.clear_notes, width=10).pack(side=tk.LEFT)
+        ttk.Button(memory_controls, text="🔄 Opdater nu", command=self.force_update_memory, width=12).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(memory_controls, text="👁️ Vis alt", command=self.show_all_memory, width=10).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(memory_controls, text="🧹 Ryd", command=self.clear_memory, width=8).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(memory_controls, text="⚙️ Indstil", command=self.open_settings, width=8).pack(side=tk.LEFT)
         
-        # Note kategorier dropdown
-        kategori_frame = ttk.Frame(notes_frame)
-        kategori_frame.pack(fill=tk.X, pady=(5, 5))
+        # Memory display
+        self.memory_display = scrolledtext.ScrolledText(memory_frame, height=6, font=("Arial", 9), 
+                                                       bg="#f9f9f9", fg="darkblue")
+        self.memory_display.pack(fill=tk.BOTH, expand=True)
         
-        ttk.Label(kategori_frame, text="📂 Kategori:").pack(side=tk.LEFT, padx=(0, 5))
-        
-        self.kategori_var = tk.StringVar(value="Alle")
-        self.kategori_combo = ttk.Combobox(kategori_frame, textvariable=self.kategori_var, width=15, state="readonly")
-        self.kategori_combo['values'] = ['Alle', 'Personlighed', 'Interesser', 'Præferencer', 'Færdigheder', 'Mål', 'Andre']
-        self.kategori_combo.pack(side=tk.LEFT, padx=(0, 5))
-        self.kategori_combo.bind('<<ComboboxSelected>>', self.refresh_notes_display)
-        
-        # Note display
-        self.notes_display = scrolledtext.ScrolledText(notes_frame, height=6, font=("Arial", 9), 
-                                                      bg="#f9f9f9", fg="darkblue")
-        self.notes_display.pack(fill=tk.BOTH, expand=True)
-        
-        # Auto-note status
-        self.auto_note_label = ttk.Label(notes_frame, text="🤖 Auto-noter: Aktiveret", 
-                                        font=("Arial", 8, "italic"))
-        self.auto_note_label.pack(fill=tk.X, pady=(2, 0))
+        # Auto-memory status
+        self.auto_memory_label = ttk.Label(memory_frame, text="🤖 Auto-hukommelse: Aktiveret", 
+                                          font=("Arial", 8, "italic"))
+        self.auto_memory_label.pack(fill=tk.X, pady=(2, 0))
         
         # Chat display område
         chat_frame = ttk.LabelFrame(main_frame, text="💬 Samtale", padding="5")
@@ -223,15 +216,15 @@ class LLMChatGUI:
         )
         self.english_checkbox.pack(side=tk.LEFT, padx=(0, 20))
         
-        # Auto-noter toggle
-        self.auto_notes_var = tk.BooleanVar(value=True)
-        self.auto_notes_checkbox = ttk.Checkbutton(
+        # Auto-memory toggle
+        self.auto_memory_var = tk.BooleanVar(value=True)
+        self.auto_memory_checkbox = ttk.Checkbutton(
             controls_row, 
-            text="🤖 Auto-noter", 
-            variable=self.auto_notes_var,
-            command=self.toggle_auto_notes
+            text="🧠 Auto-hukommelse", 
+            variable=self.auto_memory_var,
+            command=self.toggle_auto_memory
         )
-        self.auto_notes_checkbox.pack(side=tk.LEFT, padx=(0, 20))
+        self.auto_memory_checkbox.pack(side=tk.LEFT, padx=(0, 20))
         
         # Clear chat
         ttk.Button(
@@ -252,77 +245,148 @@ class LLMChatGUI:
                                    font=("Arial", 8, "italic"))
         self.user_label.pack(anchor=tk.W)
         
-        # Status og note counter
+        # Status og memory counter
         status_frame = ttk.Frame(controls_row)
         status_frame.pack(side=tk.RIGHT)
         
         self.status_label = ttk.Label(status_frame, text="🟡 Starter...")
         self.status_label.pack(anchor=tk.E)
         
-        self.note_counter_label = ttk.Label(status_frame, text="📝 Noter: 0", 
+        self.note_counter_label = ttk.Label(status_frame, text="🧠 Minder: 0", 
                                            font=("Arial", 8, "italic"))
         self.note_counter_label.pack(anchor=tk.E)
         
         # Load data og opdater displays
         self.refresh_sessions_list()
-        self.refresh_notes_display()
-        self.update_note_counter()
+        self.refresh_memory_display()
+        self.update_memory_counter()
         
         # Tilføj velkomstbesked
-        self.add_to_chat("System", f"Velkommen! Du er logget ind som bruger {self.current_user}.\nAI'en tager automatiske noter om dig og husker mellem samtaler.\nCtrl+Enter for at sende besked.", "system")
+        self.add_to_chat("System", f"Velkommen! Du er logget ind som bruger {self.current_user}.\nAI'en husker automatisk information om dig mellem samtaler.\nCtrl+Enter for at sende besked.", "system")
     
-    # AI Noter System (Forbedret og automatisk)
-    def load_ai_notes(self):
-        """Load AI noter fra fil"""
+    # Indstillinger vindue
+    def open_settings(self):
+        """Åbn indstillinger vindue"""
+        settings_window = tk.Toplevel(self.root)
+        settings_window.title("⚙️ Indstillinger")
+        settings_window.geometry("400x300")
+        settings_window.resizable(False, False)
+        
+        # Timeout indstillinger
+        timeout_frame = ttk.LabelFrame(settings_window, text="⏱️ Timeout Indstillinger", padding="10")
+        timeout_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        # Timeout enabled checkbox
+        self.timeout_enabled_var = tk.BooleanVar(value=self.timeout_enabled)
+        ttk.Checkbutton(timeout_frame, text="Aktiver timeout", 
+                       variable=self.timeout_enabled_var).pack(anchor=tk.W, pady=(0, 5))
+        
+        # Timeout slider
+        ttk.Label(timeout_frame, text="Timeout sekunder:").pack(anchor=tk.W)
+        timeout_frame_inner = ttk.Frame(timeout_frame)
+        timeout_frame_inner.pack(fill=tk.X, pady=5)
+        
+        self.timeout_var = tk.IntVar(value=self.timeout_seconds)
+        self.timeout_scale = tk.Scale(timeout_frame_inner, from_=10, to=120, 
+                                     orient=tk.HORIZONTAL, variable=self.timeout_var)
+        self.timeout_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        self.timeout_label = ttk.Label(timeout_frame_inner, text=f"{self.timeout_seconds}s")
+        self.timeout_label.pack(side=tk.RIGHT, padx=(5, 0))
+        
+        # Bind scale update
+        self.timeout_scale.bind("<Motion>", self.update_timeout_label)
+        
+        # Auto-hukommelse indstillinger
+        memory_frame = ttk.LabelFrame(settings_window, text="🧠 Hukommelse Indstillinger", padding="10")
+        memory_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        ttk.Label(memory_frame, text="Opdater hukommelse hver X besked:").pack(anchor=tk.W)
+        memory_threshold_frame = ttk.Frame(memory_frame)
+        memory_threshold_frame.pack(fill=tk.X, pady=5)
+        
+        self.memory_threshold_var = tk.IntVar(value=self.auto_memory_threshold)
+        self.memory_threshold_scale = tk.Scale(memory_threshold_frame, from_=1, to=10, 
+                                              orient=tk.HORIZONTAL, variable=self.memory_threshold_var)
+        self.memory_threshold_scale.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        self.memory_threshold_label = ttk.Label(memory_threshold_frame, text=f"{self.auto_memory_threshold}")
+        self.memory_threshold_label.pack(side=tk.RIGHT, padx=(5, 0))
+        
+        self.memory_threshold_scale.bind("<Motion>", self.update_memory_threshold_label)
+        
+        # Gem og luk knapper
+        button_frame = ttk.Frame(settings_window)
+        button_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        ttk.Button(button_frame, text="💾 Gem", command=lambda: self.save_settings(settings_window)).pack(side=tk.RIGHT, padx=(5, 0))
+        ttk.Button(button_frame, text="❌ Annuller", command=settings_window.destroy).pack(side=tk.RIGHT)
+    
+    def update_timeout_label(self, event=None):
+        """Opdater timeout label"""
+        value = self.timeout_var.get()
+        self.timeout_label.config(text=f"{value}s")
+    
+    def update_memory_threshold_label(self, event=None):
+        """Opdater memory threshold label"""
+        value = self.memory_threshold_var.get()
+        self.memory_threshold_label.config(text=f"{value}")
+    
+    def save_settings(self, window):
+        """Gem indstillinger"""
+        self.timeout_enabled = self.timeout_enabled_var.get()
+        self.timeout_seconds = self.timeout_var.get()
+        self.auto_memory_threshold = self.memory_threshold_var.get()
+        
+        # Reset message counter
+        self.message_count = 0
+        
+        window.destroy()
+        self.add_to_chat("System", f"⚙️ Indstillinger gemt! Timeout: {'ON' if self.timeout_enabled else 'OFF'} ({self.timeout_seconds}s), Hukommelse: hver {self.auto_memory_threshold}. besked", "system")
+    
+    # AI Hukommelse System (Forenklet og automatisk)
+    def load_user_memory(self):
+        """Load bruger hukommelse fra fil"""
         try:
-            if os.path.exists(self.notes_file):
-                with open(self.notes_file, 'r', encoding='utf-8') as f:
-                    self.ai_notes = json.load(f)
+            if os.path.exists(self.memory_file):
+                with open(self.memory_file, 'r', encoding='utf-8') as f:
+                    self.user_memory = json.load(f)
             else:
-                self.ai_notes = {
-                    "Personlighed": {},
-                    "Interesser": {},
-                    "Præferencer": {},
-                    "Færdigheder": {},
-                    "Mål": {},
-                    "Andre": {}
-                }
+                self.user_memory = {}
         except Exception as e:
-            print(f"Fejl ved loading af AI noter: {e}")
-            self.ai_notes = {
-                "Personlighed": {},
-                "Interesser": {},
-                "Præferencer": {},
-                "Færdigheder": {},
-                "Mål": {},
-                "Andre": {}
-            }
+            print(f"Fejl ved loading af hukommelse: {e}")
+            self.user_memory = {}
     
-    def save_ai_notes(self):
-        """Gem AI noter til fil"""
+    def save_user_memory(self):
+        """Gem bruger hukommelse til fil"""
         try:
-            with open(self.notes_file, 'w', encoding='utf-8') as f:
-                json.dump(self.ai_notes, f, ensure_ascii=False, indent=2)
+            with open(self.memory_file, 'w', encoding='utf-8') as f:
+                json.dump(self.user_memory, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            print(f"Fejl ved gemning af AI noter: {e}")
+            print(f"Fejl ved gemning af hukommelse: {e}")
     
-    def check_auto_note_update(self):
-        """Tjek om det er tid til automatisk note opdatering"""
-        if not self.auto_notes_var.get():
+    def check_auto_memory_update(self):
+        """Tjek om det er tid til automatisk hukommelse opdatering"""
+        if not self.auto_memory_var.get():
             return
             
         self.message_count += 1
         
-        if self.message_count >= self.auto_note_threshold:
+        # Vis at systemet tæller beskeder
+        if hasattr(self, 'auto_memory_label'):
+            self.auto_memory_label.config(text=f"🤖 Auto-hukommelse: {self.message_count}/{self.auto_memory_threshold}")
+        
+        if self.message_count >= self.auto_memory_threshold:
             self.message_count = 0
-            threading.Thread(target=self._auto_update_notes, daemon=True).start()
+            self.auto_memory_label.config(text="🔄 Analyserer samtale...")
+            threading.Thread(target=self._auto_update_memory, daemon=True).start()
     
-    def _auto_update_notes(self):
-        """Automatisk opdatering af noter (baggrund)"""
+    def _auto_update_memory(self):
+        """Automatisk opdatering af hukommelse (baggrund)"""
         try:
             # Saml seneste beskeder til analyse
             recent_messages = []
-            for msg in self.conversation_history[-6:]:  # Sidste 6 beskeder
+            for msg in self.conversation_history[-4:]:  # Sidste 4 beskeder
                 if msg["role"] in ["user", "assistant"]:
                     recent_messages.append(f"{msg['role']}: {msg['content']}")
             
@@ -331,43 +395,35 @@ class LLMChatGUI:
             
             conversation_text = "\n".join(recent_messages)
             
-            analysis_prompt = f"""Analyser denne seneste samtale og udtræk nye indsigter om brugeren.
+            # Fokuseret prompt for at fange interessante information
+            analysis_prompt = f"""Analyser denne samtale og find interessant information om brugeren som jeg skal huske.
 
-EKSISTERENDE NOTER:
-{json.dumps(self.ai_notes, ensure_ascii=False, indent=1)}
-
-SENESTE SAMTALE:
+SAMTALE:
 {conversation_text}
 
-Svar med PRÆCIS dette JSON format - ingen ekstra tekst:
+Find ALLE interessante facts om personen - navn, hobbier, præferencer, job, familie, mål, problemer, etc.
+
+Svar med JSON:
 {{
-    "nye_noter": [
-        {{
-            "kategori": "Personlighed|Interesser|Præferencer|Færdigheder|Mål|Andre",
-            "note": "kort specifik note",
-            "relevans": 1-10
-        }}
-    ],
-    "opdaterede_noter": [
-        {{
-            "kategori": "kategori_navn",
-            "note_id": "eksisterende_note_id",
-            "ny_note": "opdateret note tekst"
-        }}
+    "memories": [
+        {{"info": "konkret fact om personen", "importance": 1-10}}
     ]
 }}
 
-Kun tilføj noter hvis der er nye, relevante indsigter. Tom liste er OK."""
+Kun vigtig information (importance 5+). Tom liste hvis intet interessant."""
             
             headers = {"Content-Type": "application/json"}
             data = {
                 "messages": [{"role": "user", "content": analysis_prompt}],
-                "temperature": 0.2,
-                "max_tokens": 500,
+                "temperature": 0.1,
+                "max_tokens": 300,
                 "stream": False
             }
             
-            response = requests.post(self.llm_url, json=data, headers=headers, timeout=30)
+            # Brug konfigurerbar timeout
+            timeout = self.timeout_seconds if self.timeout_enabled else None
+            
+            response = requests.post(self.llm_url, json=data, headers=headers, timeout=timeout)
             response.raise_for_status()
             result = response.json()
             
@@ -381,194 +437,210 @@ Kun tilføj noter hvis der er nye, relevante indsigter. Tom liste er OK."""
                 
                 if start >= 0 and end > start:
                     json_str = ai_response[start:end]
-                    note_updates = json.loads(json_str)
+                    memory_updates = json.loads(json_str)
                     
-                    # Behandl nye noter
+                    # Tilføj nye minder
                     new_count = 0
-                    if "nye_noter" in note_updates:
-                        for note_data in note_updates["nye_noter"]:
-                            if note_data.get("relevans", 0) >= 5:  # Kun relevante noter
-                                kategori = note_data.get("kategori", "Andre")
-                                note_text = note_data.get("note", "")
+                    if "memories" in memory_updates:
+                        for memory_data in memory_updates["memories"]:
+                            importance = memory_data.get("importance", 0)
+                            if importance >= 5:  # Kun vigtige minder
+                                info = memory_data.get("info", "")
                                 
-                                if kategori in self.ai_notes and note_text:
-                                    note_id = str(int(time.time() * 1000))  # Timestamp som ID
-                                    self.ai_notes[kategori][note_id] = {
-                                        "note": note_text,
+                                if info and not self._memory_exists(info):
+                                    memory_id = str(int(time.time() * 1000))
+                                    self.user_memory[memory_id] = {
+                                        "info": info,
                                         "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                                        "relevans": note_data.get("relevans", 5)
+                                        "importance": importance
                                     }
                                     new_count += 1
                     
-                    # Behandl opdateringer
-                    update_count = 0
-                    if "opdaterede_noter" in note_updates:
-                        for update_data in note_updates["opdaterede_noter"]:
-                            kategori = update_data.get("kategori")
-                            note_id = update_data.get("note_id")
-                            ny_note = update_data.get("ny_note")
-                            
-                            if (kategori in self.ai_notes and 
-                                note_id in self.ai_notes[kategori] and 
-                                ny_note):
-                                self.ai_notes[kategori][note_id]["note"] = ny_note
-                                self.ai_notes[kategori][note_id]["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-                                update_count += 1
-                    
-                    # Gem og opdater GUI hvis der er ændringer
-                    if new_count > 0 or update_count > 0:
-                        self.save_ai_notes()
-                        self.root.after(0, self._handle_auto_notes_success, new_count, update_count)
+                    # Gem og opdater GUI hvis der er nye minder
+                    if new_count > 0:
+                        self.save_user_memory()
+                        self.root.after(0, self._handle_auto_memory_success, new_count)
+                    else:
+                        # Vis at systemet kører, selvom ingen nye minder
+                        self.root.after(0, lambda: self.auto_memory_label.config(text="🤖 Ingen nye minder denne gang"))
+                        self.root.after(3000, lambda: self.auto_memory_label.config(text="🤖 Auto-hukommelse: Aktiveret"))
                     
             except json.JSONDecodeError as e:
-                print(f"Auto-noter JSON fejl: {e}")
+                print(f"Auto-hukommelse JSON fejl: {e}")
+                self.root.after(0, lambda: self.auto_memory_label.config(text="❌ Hukommelse JSON fejl"))
                 
+        except requests.exceptions.Timeout:
+            print("Auto-hukommelse timeout")
+            self.root.after(0, lambda: self.auto_memory_label.config(text="⏱️ Hukommelse timeout (juster i indstillinger)"))
+            self.root.after(5000, lambda: self.auto_memory_label.config(text="🤖 Auto-hukommelse: Aktiveret"))
+        except requests.exceptions.ConnectionError:
+            print("Auto-hukommelse forbindelse fejl")
+            self.root.after(0, lambda: self.auto_memory_label.config(text="❌ LLM ikke tilgængelig"))
         except Exception as e:
-            print(f"Auto-noter fejl: {e}")
+            print(f"Auto-hukommelse generel fejl: {e}")
+            self.root.after(0, lambda: self.auto_memory_label.config(text="❌ Hukommelse fejl"))
     
-    def _handle_auto_notes_success(self, new_count, update_count):
-        """Håndter succesfuld auto-note opdatering"""
-        self.refresh_notes_display()
-        self.update_note_counter()
+    def _memory_exists(self, new_info):
+        """Tjek om lignende hukommelse allerede eksisterer"""
+        new_info_lower = new_info.lower()
+        for memory_data in self.user_memory.values():
+            existing_info = memory_data.get("info", "").lower()
+            # Simpel check for overlap (kan forbedres)
+            if len(new_info_lower) > 10 and new_info_lower in existing_info:
+                return True
+            if len(existing_info) > 10 and existing_info in new_info_lower:
+                return True
+        return False
+    
+    def _handle_auto_memory_success(self, new_count):
+        """Håndter succesfuld auto-hukommelse opdatering"""
+        self.refresh_memory_display()
+        self.update_memory_counter()
         
-        if new_count > 0 or update_count > 0:
-            status_msg = f"🤖 {new_count} nye noter"
-            if update_count > 0:
-                status_msg += f", {update_count} opdateret"
-            self.auto_note_label.config(text=status_msg)
+        if new_count > 0:
+            status_msg = f"✅ {new_count} nye minder!"
+            self.auto_memory_label.config(text=status_msg)
             
             # Reset til normal status efter 3 sekunder
-            self.root.after(3000, lambda: self.auto_note_label.config(text="🤖 Auto-noter: Aktiveret"))
+            self.root.after(3000, lambda: self.auto_memory_label.config(text="🤖 Auto-hukommelse: Aktiveret"))
     
-    def force_update_notes(self):
-        """Tving note opdatering nu"""
+    def force_update_memory(self):
+        """Tving hukommelse opdatering nu"""
         if len(self.conversation_history) < 3:
-            messagebox.showinfo("Info", "For få beskeder til at opdatere noter. Chat lidt mere først!")
+            messagebox.showinfo("Info", "For få beskeder til at opdatere hukommelse. Chat lidt mere først!")
             return
         
-        self.auto_note_label.config(text="🔄 Opdaterer noter...")
-        threading.Thread(target=self._auto_update_notes, daemon=True).start()
+        self.auto_memory_label.config(text="🔄 Opdaterer hukommelse...")
+        threading.Thread(target=self._auto_update_memory, daemon=True).start()
     
-    def refresh_notes_display(self, event=None):
-        """Opdater noter display baseret på valgt kategori"""
-        if not hasattr(self, 'notes_display'):
+    def refresh_memory_display(self):
+        """Opdater hukommelse display"""
+        if not hasattr(self, 'memory_display'):
             return
         
-        self.notes_display.config(state=tk.NORMAL)
-        self.notes_display.delete("1.0", tk.END)
+        self.memory_display.config(state=tk.NORMAL)
+        self.memory_display.delete("1.0", tk.END)
         
-        kategori = self.kategori_var.get()
-        
-        if kategori == "Alle":
-            # Vis alle kategorier
-            for kat_navn, noter in self.ai_notes.items():
-                if noter:  # Kun hvis der er noter i kategorien
-                    self.notes_display.insert(tk.END, f"📂 {kat_navn}\n", f"kategori_{kat_navn}")
-                    for note_id, note_data in sorted(noter.items(), 
-                                                   key=lambda x: x[1].get("created", ""), reverse=True)[:3]:  # Max 3 per kategori
-                        relevans = "⭐" * note_data.get("relevans", 1)
-                        self.notes_display.insert(tk.END, f"  • {note_data['note']} {relevans}\n")
-                    self.notes_display.insert(tk.END, "\n")
+        if self.user_memory:
+            # Sorter efter vigtighed og dato
+            sorted_memories = sorted(self.user_memory.items(), 
+                                   key=lambda x: (x[1].get("importance", 0), x[1].get("created", "")), 
+                                   reverse=True)
+            
+            for memory_id, memory_data in sorted_memories[:10]:  # Vis top 10
+                info = memory_data.get("info", "")
+                importance = memory_data.get("importance", 0)
+                created = memory_data.get("created", "")
+                
+                stars = "⭐" * min(importance, 5)  # Max 5 stjerner visuel
+                self.memory_display.insert(tk.END, f"• {info} {stars}\n")
+                self.memory_display.insert(tk.END, f"  📅 {created}\n\n")
         else:
-            # Vis specifik kategori
-            if kategori in self.ai_notes and self.ai_notes[kategori]:
-                self.notes_display.insert(tk.END, f"📂 {kategori}\n\n", f"kategori_{kategori}")
-                for note_id, note_data in sorted(self.ai_notes[kategori].items(), 
-                                               key=lambda x: x[1].get("created", ""), reverse=True):
-                    created = note_data.get("created", "Ukendt")
-                    relevans = "⭐" * note_data.get("relevans", 1)
-                    self.notes_display.insert(tk.END, f"• {note_data['note']} {relevans}\n")
-                    self.notes_display.insert(tk.END, f"  📅 {created}\n\n")
-            else:
-                self.notes_display.insert(tk.END, f"Ingen noter i '{kategori}' endnu.\n\nChat med AI'en og den vil automatisk tilføje noter!")
+            self.memory_display.insert(tk.END, "Ingen minder endnu.\n\nChat med AI'en og den vil automatisk huske interessant information om dig!")
         
-        # Styling
-        for kat in self.ai_notes.keys():
-            self.notes_display.tag_config(f"kategori_{kat}", foreground="darkblue", font=("Arial", 10, "bold"))
-        
-        self.notes_display.config(state=tk.DISABLED)
+        self.memory_display.config(state=tk.DISABLED)
     
-    def show_all_notes(self):
-        """Vis alle noter i nyt vindue"""
-        notes_window = tk.Toplevel(self.root)
-        notes_window.title(f"🧠 Alle AI Noter - Bruger: {self.current_user}")
-        notes_window.geometry("800x600")
+    def show_all_memory(self):
+        """Vis alle minder i nyt vindue"""
+        memory_window = tk.Toplevel(self.root)
+        memory_window.title(f"🧠 Alle Minder - Bruger: {self.current_user}")
+        memory_window.geometry("700x500")
         
-        # Notebook for kategorier
-        notebook = ttk.Notebook(notes_window)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # Sorter efter vigtighed
+        controls_frame = ttk.Frame(memory_window)
+        controls_frame.pack(fill=tk.X, padx=10, pady=5)
         
-        for kategori, noter in self.ai_notes.items():
-            if noter:  # Kun kategorier med noter
-                frame = ttk.Frame(notebook)
-                notebook.add(frame, text=f"{kategori} ({len(noter)})")
-                
-                text_widget = scrolledtext.ScrolledText(frame, wrap=tk.WORD, font=("Arial", 11))
-                text_widget.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-                
-                for note_id, note_data in sorted(noter.items(), 
-                                               key=lambda x: x[1].get("created", ""), reverse=True):
-                    created = note_data.get("created", "Ukendt")
-                    relevans = "⭐" * note_data.get("relevans", 1)
-                    text_widget.insert(tk.END, f"• {note_data['note']} {relevans}\n")
-                    text_widget.insert(tk.END, f"  📅 Oprettet: {created}\n")
-                    if "updated" in note_data:
-                        text_widget.insert(tk.END, f"  🔄 Opdateret: {note_data['updated']}\n")
-                    text_widget.insert(tk.END, "\n")
-                
+        ttk.Label(controls_frame, text="Sorter efter:").pack(side=tk.LEFT, padx=(0, 5))
+        
+        sort_var = tk.StringVar(value="Vigtighed")
+        sort_combo = ttk.Combobox(controls_frame, textvariable=sort_var, 
+                                 values=["Vigtighed", "Dato (nyeste)", "Dato (ældste)"], 
+                                 state="readonly", width=15)
+        sort_combo.pack(side=tk.LEFT, padx=(0, 10))
+        
+        text_widget = scrolledtext.ScrolledText(memory_window, wrap=tk.WORD, font=("Arial", 11))
+        text_widget.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        def update_display():
+            text_widget.config(state=tk.NORMAL)
+            text_widget.delete("1.0", tk.END)
+            
+            if not self.user_memory:
+                text_widget.insert(tk.END, "Ingen minder endnu.")
                 text_widget.config(state=tk.DISABLED)
+                return
+            
+            # Sorter baseret på valg
+            sort_choice = sort_var.get()
+            if sort_choice == "Vigtighed":
+                sorted_memories = sorted(self.user_memory.items(), 
+                                       key=lambda x: x[1].get("importance", 0), reverse=True)
+            elif sort_choice == "Dato (nyeste)":
+                sorted_memories = sorted(self.user_memory.items(), 
+                                       key=lambda x: x[1].get("created", ""), reverse=True)
+            else:  # Dato (ældste)
+                sorted_memories = sorted(self.user_memory.items(), 
+                                       key=lambda x: x[1].get("created", ""))
+            
+            for i, (memory_id, memory_data) in enumerate(sorted_memories, 1):
+                info = memory_data.get("info", "")
+                importance = memory_data.get("importance", 0)
+                created = memory_data.get("created", "Ukendt")
+                
+                stars = "⭐" * importance
+                text_widget.insert(tk.END, f"{i}. {info}\n")
+                text_widget.insert(tk.END, f"   Vigtighed: {stars} ({importance}/10)\n")
+                text_widget.insert(tk.END, f"   📅 Oprettet: {created}\n")
+                text_widget.insert(tk.END, f"   🆔 ID: {memory_id}\n\n")
+            
+            text_widget.config(state=tk.DISABLED)
+        
+        sort_combo.bind('<<ComboboxSelected>>', lambda e: update_display())
+        update_display()
     
-    def clear_notes(self):
-        """Ryd alle AI noter efter bekræftelse"""
-        if messagebox.askyesno("Bekræft", "Slet ALLE AI noter? Dette kan ikke fortrydes!"):
-            self.ai_notes = {
-                "Personlighed": {},
-                "Interesser": {},
-                "Præferencer": {},
-                "Færdigheder": {},
-                "Mål": {},
-                "Andre": {}
-            }
-            self.save_ai_notes()
-            self.refresh_notes_display()
-            self.update_note_counter()
-            self.add_to_chat("System", "🧹 Alle AI noter er slettet!", "system")
+    def clear_memory(self):
+        """Ryd alle minder efter bekræftelse"""
+        if messagebox.askyesno("Bekræft", "Slet ALLE minder? Dette kan ikke fortrydes!"):
+            self.user_memory = {}
+            self.save_user_memory()
+            self.refresh_memory_display()
+            self.update_memory_counter()
+            self.add_to_chat("System", "🧹 Alle minder er slettet!", "system")
     
-    def update_note_counter(self):
-        """Opdater note tæller"""
+    def update_memory_counter(self):
+        """Opdater memory tæller"""
         if hasattr(self, 'note_counter_label'):
-            total_notes = sum(len(noter) for noter in self.ai_notes.values())
-            self.note_counter_label.config(text=f"📝 Noter: {total_notes}")
+            total_memories = len(self.user_memory)
+            self.note_counter_label.config(text=f"🧠 Minder: {total_memories}")
     
-    def toggle_auto_notes(self):
-        """Toggle automatiske noter"""
-        enabled = self.auto_notes_var.get()
+    def toggle_auto_memory(self):
+        """Toggle automatiske minder"""
+        enabled = self.auto_memory_var.get()
         status = "Aktiveret" if enabled else "Deaktiveret"
-        self.auto_note_label.config(text=f"🤖 Auto-noter: {status}")
+        self.auto_memory_label.config(text=f"🤖 Auto-hukommelse: {status}")
         
         if enabled:
-            self.add_to_chat("System", "🤖 Automatiske noter aktiveret!", "system")
+            self.add_to_chat("System", "🤖 Automatisk hukommelse aktiveret!", "system")
         else:
-            self.add_to_chat("System", "🤖 Automatiske noter deaktiveret.", "system")
+            self.add_to_chat("System", "🤖 Automatisk hukommelse deaktiveret.", "system")
     
-    def get_notes_for_ai(self):
-        """Få noter til AI system prompt"""
-        if not any(self.ai_notes.values()):
+    def get_memory_for_ai(self):
+        """Få minder til AI system prompt"""
+        if not self.user_memory:
             return ""
         
-        notes_summary = "\n\nVigtige noter om brugeren (brug til at give bedre svar):\n"
+        memory_summary = "\n\nVigtig information om brugeren (brug til at give bedre svar):\n"
         
-        for kategori, noter in self.ai_notes.items():
-            if noter:
-                # Få de mest relevante noter (højeste relevans score)
-                top_notes = sorted(noter.items(), 
-                                 key=lambda x: x[1].get("relevans", 0), reverse=True)[:2]
-                if top_notes:
-                    notes_summary += f"\n{kategori}:\n"
-                    for note_id, note_data in top_notes:
-                        notes_summary += f"  - {note_data['note']}\n"
+        # Få de mest vigtige minder
+        sorted_memories = sorted(self.user_memory.items(), 
+                               key=lambda x: x[1].get("importance", 0), reverse=True)
         
-        return notes_summary
+        for memory_id, memory_data in sorted_memories[:8]:  # Top 8 vigtigste minder
+            info = memory_data.get("info", "")
+            if info:
+                memory_summary += f"- {info}\n"
+        
+        return memory_summary
     
     # Session Management (forbedret med bruger isolation)
     def create_new_session(self):
@@ -597,7 +669,13 @@ Kun tilføj noter hvis der er nye, relevante indsigter. Tom liste er OK."""
             self.refresh_sessions_list()
             self.clear_chat_display()
             self.update_session_label()
-            self.add_to_chat("System", f"Ny samtale '{session_name}' oprettet!", "system")
+            
+            # Vis hvor mange minder AI'en allerede har
+            memory_count = len(self.user_memory)
+            if memory_count > 0:
+                self.add_to_chat("System", f"Ny samtale '{session_name}' oprettet! AI'en husker allerede {memory_count} ting om dig.", "system")
+            else:
+                self.add_to_chat("System", f"Ny samtale '{session_name}' oprettet!", "system")
     
     def load_sessions(self):
         """Load kun denne brugers sessions"""
@@ -835,11 +913,11 @@ Kun tilføj noter hvis der er nye, relevante indsigter. Tom liste er OK."""
         try:
             headers = {"Content-Type": "application/json"}
             
-            # Byg forbedret system prompt med AI noter
+            # Byg forbedret system prompt med AI minder
             enhanced_system_prompt = self.system_prompt["content"]
-            notes_summary = self.get_notes_for_ai()
-            if notes_summary:
-                enhanced_system_prompt += notes_summary
+            memory_summary = self.get_memory_for_ai()
+            if memory_summary:
+                enhanced_system_prompt += memory_summary
             
             # Tilføj til historie
             self.conversation_history.append({"role": "user", "content": prompt})
@@ -857,7 +935,10 @@ Kun tilføj noter hvis der er nye, relevante indsigter. Tom liste er OK."""
             
             self.update_status("🤖 Tænker...")
             
-            response = requests.post(self.llm_url, json=data, headers=headers, timeout=35)
+            # Brug konfigurerbar timeout
+            timeout = self.timeout_seconds if self.timeout_enabled else None
+            
+            response = requests.post(self.llm_url, json=data, headers=headers, timeout=timeout)
             response.raise_for_status()
             result = response.json()
             
@@ -867,6 +948,9 @@ Kun tilføj noter hvis der er nye, relevante indsigter. Tom liste er OK."""
             # Opdater GUI i main thread
             self.root.after(0, self._handle_llm_response, assistant_response)
             
+        except requests.exceptions.Timeout:
+            timeout_msg = f"Timeout efter {self.timeout_seconds}s. Juster i indstillinger hvis nødvendigt."
+            self.root.after(0, self._handle_llm_error, timeout_msg)
         except requests.exceptions.ConnectionError:
             error_msg = "Kan ikke forbinde til LLM. Er LM Studio kørende?"
             self.root.after(0, self._handle_llm_error, error_msg)
@@ -880,8 +964,8 @@ Kun tilføj noter hvis der er nye, relevante indsigter. Tom liste er OK."""
         self.send_button.config(state=tk.NORMAL, text="📤 Send")
         self.update_status("✅ Klar")
         
-        # Tjek for automatisk note opdatering
-        self.check_auto_note_update()
+        # Tjek for automatisk hukommelse opdatering
+        self.check_auto_memory_update()
         
         # Oplæs hvis aktiveret
         if self.tts_var.get() and self.tts_engine:
@@ -981,7 +1065,13 @@ Kun tilføj noter hvis der er nye, relevante indsigter. Tom liste er OK."""
         self.conversation_history = [self.system_prompt.copy()]
         self.clear_chat_display()
         self.message_count = 0  # Reset message counter
-        self.add_to_chat("System", "Chat ryddet. Start en ny samtale!", "system")
+        
+        # Vis eksisterende minder når chat ryddes
+        memory_count = len(self.user_memory)
+        if memory_count > 0:
+            self.add_to_chat("System", f"Chat ryddet. AI'en husker stadig {memory_count} ting om dig! Start en ny samtale.", "system")
+        else:
+            self.add_to_chat("System", "Chat ryddet. Start en ny samtale!", "system")
         
         # Opdater session
         if (self.current_session_id and 
@@ -1008,7 +1098,7 @@ Kun tilføj noter hvis der er nye, relevante indsigter. Tom liste er OK."""
         
         # Gem alle data
         self.save_sessions()
-        self.save_ai_notes()
+        self.save_user_memory()
         
         self.root.destroy()
 
@@ -1016,10 +1106,12 @@ def main():
     """Hovedfunktion"""
     print("🚀 Starter Optimeret LLM Chat GUI...")
     print("✨ Nye funktioner:")
-    print("  - Automatiske AI noter (løbende)")
-    print("  - Bruger isolation (ingen delte samtaler)")
-    print("  - Forbedret note system med kategorier")
-    print("  - Bedre sikkerhed og performance")
+    print("  - Konfigurerbar timeout (10-120 sekunder)")
+    print("  - Kan slå timeout helt fra")
+    print("  - Automatisk AI hukommelse (ingen kategorier)")
+    print("  - Permanent hukommelse på tværs af samtaler")
+    print("  - Indstillinger menu (⚙️)")
+    print("  - Bruger isolation (sikre samtaler)")
     app = LLMChatGUI()
     app.run()
 
