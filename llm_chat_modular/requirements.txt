@@ -1,0 +1,15 @@
+# LLM Chat GUI Requirements
+# Installer med: pip install -r requirements.txt
+
+# Core dependencies
+requests>=2.31.0
+pyttsx3>=2.90
+SpeechRecognition>=3.10.0
+
+# Audio dependencies (valgfri - for bedre mikrofon support)
+pyaudio>=0.2.11
+
+# Development dependencies (valgfri)
+pytest>=7.4.0
+black>=23.0.0
+flake8>=6.0.0
